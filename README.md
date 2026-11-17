@@ -25,9 +25,9 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-The implementation uses the Python standard library plus the existing
-`requests` dependency. Tests use the existing `pytest` dependency. All generated
-`data/` files are ignored by Git.
+Day 1 and Day 2 use the Python standard library plus `requests`; Day 3 adds
+Pandas, Matplotlib, and scikit-learn for local analysis and CPU-only models.
+Tests use `pytest`. Generated `data/` and `artifacts/` files are ignored by Git.
 
 ## Day 2 architecture
 
@@ -274,5 +274,140 @@ python -m scripts.smoke_test
   verified rain-gauge observations are not included.
 - The conservative six-day archive cutoff may exclude some recently available
   records; actual API coverage and gaps appear in reports.
-- No training, evaluation, drift detection, dashboard, agent/LLM, database, or
-  Hopsworks integration is included in Day 2.
+- Drift detection, dashboard, agent/LLM, database, and Hopsworks integration
+  remain out of scope.
+
+## Day 3: exploratory analysis and first forecasting models
+
+Run the local EDA and baseline experiments from the repository root:
+
+```powershell
+python -m scripts.train_baselines
+```
+
+The command reads only `data/processed/features.csv` and local manifests. It
+does not download data. Optional paths:
+
+```powershell
+python -m scripts.train_baselines --data-dir .\data --output-dir .\artifacts\day3
+```
+
+It generates:
+
+- `artifacts/day3/eda/eda_report.md` and `dataset_inspection.json`.
+- PNG charts for hourly temperature, humidity distribution, rainfall and rain
+  occurrence, wind speed and circular direction, AQI/PM2.5, UV, missingness and
+  correlations, and local time-of-day behavior.
+- `artifacts/day3/model_evaluation.csv` with validation comparisons and final
+  test scores by metric, horizon, and model, plus `model_evaluation.md`.
+- `artifacts/day3/selected_models.json` with dataset hashes, feature lists,
+  date ranges, split boundaries, validation selection scores, and estimator
+  settings.
+- `artifacts/day3/test_predictions.csv` with explicit UTC issue time, target
+  time, horizon, selected-model prediction, and seasonal-naive prediction.
+- `artifacts/day3/selected_models.joblib` containing only validation-selected
+  fitted estimators (the seasonal-naive baseline needs no saved estimator).
+
+### EDA and input data
+
+EDA uses the actual processed hourly observations. The machine-readable
+inspection records column names/types, null percentages, source attribution,
+UTC coverage, and the 240 `target_*` columns in the input CSV. All target
+columns are excluded from model inputs. The separate Historical Forecast API
+probability dataset is not merged or used: it lacks per-value issuance and lead
+times. The historical weather archive's all-null precipitation-probability
+feature is dropped when its training segment contains no observed values.
+
+### Chronological evaluation and leakage controls
+
+The 70%/15%/15% chronological boundaries are based on issue-time ordering. For
+each forecast horizon `h`, the final `h` issue rows before the train/validation
+boundary and before the validation/test boundary are purged, keeping each
+partition's future labels inside that partition. Rows with missing target
+values are excluded per metric/horizon, not imputed. The test period is scored
+only after all model choices have been made from validation results.
+
+Ridge preprocessing uses a median imputer and standard scaler inside a
+scikit-learn pipeline fitted on training rows only. Random Forest imputers are
+also fit only on training rows. The lightweight CPU configuration is
+deterministic. Seasonal naive uses the exact previous-day value at the target's
+valid time; when that value is unavailable it is left unavailable, and rows
+without a baseline value are omitted from like-for-like model comparisons.
+
+Ridge alpha values are compared on validation data. Random Forest regression
+and a probability-producing Random Forest classifier are compared with the
+seasonal-naive baseline over horizons 1–24. Continuous targets use MAE, RMSE,
+and R². Rain occurrence uses Brier score, precision, recall, and F1 at a 0.5
+classification threshold. Wind direction is modeled as sine/cosine components
+and evaluated with circular angular MAE/RMSE; ordinary linear R² is not used
+for this circular target. The precipitation regressor's negative predictions
+are floored at 0 mm. Model selection and test performance are reported per
+metric and horizon; scores from different units are not combined.
+
+This is an initial short-history experiment: 90 days of modeled/reanalysis data
+cannot establish seasonal or year-over-year generalization. Rain labels are a
+reanalysis precipitation proxy rather than rain-gauge ground truth; any
+validation-selected model that loses to the baseline should be retained as a
+negative result, not described as an improvement. LSTM, model registries,
+forecast-probability training, dashboard, and Hopsworks are not included.
+
+### Actual local run and observations
+
+The Day 3 run used the existing **2,160** hourly rows (local dates
+2026-08-14–2026-11-11), 414 processed columns, and **165 numeric candidate
+inputs** before per-training-split removal of all-null features. The source CSV
+also has 240 future-target columns; all were excluded from inputs. There were
+no duplicate or missing UTC hours. Joined UV is available for all rows, while
+archived weather UV and precipitation probability remain 100% missing.
+
+| Metric | Mean | Observed range |
+| --- | ---: | ---: |
+| Temperature | 28.37 °C | 20.1–37.2 °C |
+| Relative humidity | 70.17% | 10–99% |
+| Precipitation | 0.0138 mm/hour | 0–1.8 mm |
+| Wind speed | 11.06 km/h | 0.3–23.2 km/h |
+| US AQI | 82.54 | 59–158 |
+| PM2.5 | 25.58 µg/m³ | 8.6–75 µg/m³ |
+| UV Index | 1.54 | 0–9.75 |
+
+Rain occurrence (`precipitation_mm > 0`) was positive for 212/2,160 hours
+(9.81%). All positive rain hours fell in the training period; there were **no
+positive labels in validation or test**. Consequently, the rain test Brier
+score of 0 and zero precision/recall/F1 do **not** demonstrate useful rain
+forecast skill. Precipitation test MAE/RMSE are likewise 0 because the holdout
+periods had no rain; R² is left undefined for a constant target.
+
+The base chronological boundaries contain 1,512 train, 324 validation, and 324
+test issue-time rows. Purging and target availability give, at h01, 1,511/323/323
+usable train/validation/test rows; at h24, 1,488/300/300. Models are selected
+per metric/horizon by validation MAE, circular MAE, or Brier score, then the
+test partition is used only for the selected candidate and seasonal-naive
+comparison.
+
+Test MAE (or circular MAE / Brier score for the corresponding targets) at h01
+and h24 was:
+
+| Metric | h01 selected (score; seasonal naive) | h24 selected (score; seasonal naive) |
+| --- | --- | --- |
+| Temperature | Ridge α=10 (0.607; 0.889 °C) | Seasonal naive (0.878; 0.878 °C) |
+| Humidity | Ridge α=10 (3.392; 11.904 percentage points) | Seasonal naive (12.240; 12.240 percentage points) |
+| Precipitation | Seasonal naive (0; 0 mm) | Seasonal naive (0; 0 mm) |
+| Wind speed | Ridge α=10 (1.057; 1.837 km/h) | Seasonal naive (1.849; 1.849 km/h) |
+| US AQI | Ridge α=0.1 (2.379; 11.189) | Seasonal naive (10.017; 10.017) |
+| UV Index | Seasonal naive (0.044; 0.044) | Seasonal naive (0.038; 0.038) |
+| Wind direction | Ridge α=10 (19.13°; 22.49° circular MAE) | Seasonal naive (22.65°; 22.65° circular MAE) |
+| Rain occurrence | Seasonal naive (Brier 0; 0) | Seasonal naive (Brier 0; 0) |
+
+At wind-direction h01, Ridge improves circular MAE but has higher circular RMSE
+(32.72°) than seasonal naive (29.59°). Across all 24 test horizons, a
+validation-selected learned model beat the seasonal-naive selection metric on
+8 humidity horizons and 15 AQI horizons, plus one temperature, two wind-speed,
+and one wind-direction horizon. Random Forest was selected on validation for
+wind speed at h02–h13, but its test MAE was worse than the seasonal baseline at
+11 of those 12 horizons. The seasonal naive was selected for every
+precipitation, UV, and rain-occurrence horizon. These results are short-period
+comparisons, not evidence of year-round generalization.
+
+The complete 24-horizon MAE/RMSE/R² and classification metrics, test
+predictions, selected-model metadata, and EDA charts are generated locally as
+described above; no model scores are hard-coded into the pipeline.
