@@ -52,6 +52,10 @@ Open-Meteo Air Quality API ─────────┘          │
   the processed dataset and reports.
 - `scripts/build_features.py`: rebuilds processed data from existing raw CSVs
   without making API requests.
+- `scripts/refresh_historical_uv.py`: updates an existing air-quality dataset
+  with cloud-aware hourly UV without re-fetching weather.
+- `scripts/backfill_forecast_information.py`: stores forecast probabilities
+  separately from observation-aligned features and targets.
 
 ## Historical sources and supported variables
 
@@ -59,21 +63,36 @@ Open-Meteo Air Quality API ─────────┘          │
   at `https://archive-api.open-meteo.com/v1/archive`.
 - [Open-Meteo Air Quality API](https://open-meteo.com/en/docs/air-quality-api)
   at `https://air-quality-api.open-meteo.com/v1/air-quality`.
+- [Open-Meteo Historical Forecast API](https://open-meteo.com/en/docs/historical-forecast-api)
+  at `https://historical-forecast-api.open-meteo.com/v1/forecast`.
 - Default location: Karachi, Pakistan (`24.8607`, `67.0011`), timezone
   `Asia/Karachi`.
 - Weather variables requested: temperature (°C), relative humidity (%),
   precipitation (mm), precipitation probability (%), wind speed (km/h), wind
   direction (degrees), and UV index.
-- Air-quality variables requested: US AQI and PM2.5 (µg/m³).
+- Air-quality variables requested: US AQI, PM2.5 (µg/m³), and cloud-aware UV
+  Index.
 
-The historical archive accepts hourly precipitation-probability and UV
-variables, but the executed 90-day range returned all-null arrays for both
-(precipitation probability also had no unit). The pipeline records
-`no_historical_values`, keeps those values missing, and creates no targets for
-them. AQI and PM2.5 were available from the air-quality endpoint as modeled
-historical data; they are not observations from a local sensor. The exact
-returned variables and coverage are recorded in `data/raw/manifest.json` and
-the quality reports.
+The historical weather archive returned all-null hourly UV and precipitation
+probability for the 90-day run. A separate 90-day request to the Air Quality
+API returned 2,160 non-null hourly `uv_index` values for Karachi (including
+nonzero daytime readings). The pipeline uses that cloud-aware UV Index, not
+`uv_index_clear_sky`; its unit is the dimensionless UV index (the response's
+`hourly_units` value is blank). US AQI and PM2.5 are modeled air-quality values,
+not local sensor observations. The joined dataset records whether each UV
+value came from the weather archive or the air-quality API.
+
+The Historical Forecast API returned hourly precipitation-probability values
+for the same 90-day period (unit `%`). This is **forecast data, not observed
+rainfall**. The API response omits per-value model identity, run, issue time,
+and lead time, and its documentation describes a continuous series stitched
+from successive runs. It is persisted separately and excluded from features
+and rain-occurrence targets because its as-of time cannot be verified. UV
+availability, forecast metadata, and coverage are recorded in the manifests
+and quality report.
+
+The Historical Forecast API also supports daily `uv_index_max`, not hourly UV;
+the separate cloud-aware hourly UV source above is used instead.
 
 The default 90-day request ends six days behind the current date as a
 conservative buffer for incomplete/recent archive data. The APIs may still
@@ -106,6 +125,8 @@ UTC timestamp; it does not append duplicate rows. Successful runs write:
 - `data/raw/weather.csv` and `data/raw/air_quality.csv`
 - `data/raw/manifest.json` with sources, units, availability, coverage, and
   schemas
+- `data/raw/historical_forecast_precipitation_probability.csv` is created
+  separately by the optional forecast-information command below.
 - `data/processed/features.csv`
 - `data/reports/quality_report.json` and `quality_report.md`
 
@@ -124,6 +145,24 @@ python -m scripts.build_features
 
 This command reads only local files and does not make an API request. It also
 accepts `--max-forward-fill-hours` and `--data-dir`.
+
+To refresh UV for an existing Day 2 raw dataset without re-fetching weather:
+
+```powershell
+python -m scripts.refresh_historical_uv
+python -m scripts.build_features
+```
+
+To fetch the separately archived forecast probabilities for the date range in
+the raw manifest:
+
+```powershell
+python -m scripts.backfill_forecast_information
+```
+
+This writes `data/raw/historical_forecast_precipitation_probability.csv` and
+`data/raw/historical_forecast_manifest.json`. These forecast probabilities
+remain separate from the model feature dataset and observed-rain labels.
 
 ## Alignment, quality, and missing-data policy
 
@@ -173,11 +212,14 @@ created only where the metric has historical values; a missing future reading
 remains null. The newest rows receive no target unless the exact future data
 exists.
 
-Historical precipitation probability may be null and has no target unless
-actual target values are returned in a later range.
-`target_rain_occurred_hNN` is an optional *different task*, derived from
-observed/model precipitation (`precipitation_mm > 0`); it is not a probability
-forecast. Wind direction targets are output as paired
+The historical-weather archive's precipitation-probability values remain
+missing; the separate Historical Forecast API probabilities are not targets.
+`target_rain_occurred_hNN` is a rain-occurrence *classification label* with
+the explicit rule `precipitation_mm > 0.0` (strictly greater than zero).
+Missing future precipitation produces a missing label. Because the historical
+weather source is reanalysis, this label is a modeled precipitation proxy,
+not station-observed ground truth, and is not a probability forecast. Wind
+direction targets are output as paired
 `target_wind_direction_sin_hNN` and `target_wind_direction_cos_hNN` values.
 Recover an angle with `atan2(sin, cos)`; do not treat degrees as an ordinary
 linear target.
@@ -226,7 +268,10 @@ python -m scripts.smoke_test
 - Open-Meteo weather and AQI/PM2.5 values are modeled products, not local
   station/sensor observations.
 - The tested historical weather range returned no precipitation-probability
-  values. Rain occurrence is a distinct optional target.
+  values. Forecast probabilities are available separately but lack per-record
+  issue-time/lead-time metadata, so they are excluded from model inputs.
+- Rain-occurrence labels use the archive's reanalysis precipitation as a proxy;
+  verified rain-gauge observations are not included.
 - The conservative six-day archive cutoff may exclude some recently available
   records; actual API coverage and gaps appear in reports.
 - No training, evaluation, drift detection, dashboard, agent/LLM, database, or

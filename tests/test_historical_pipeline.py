@@ -1,5 +1,6 @@
 """Deterministic tests for historical ingestion and time-series processing."""
 
+import json
 from datetime import date, datetime, timedelta, timezone
 from math import isclose
 from pathlib import Path
@@ -22,8 +23,11 @@ from aetherix_weather.dataset import (
 from aetherix_weather.historical import (
     AIR_QUALITY_HOURLY_FIELDS,
     ARCHIVE_WEATHER_API_URL,
+    HISTORICAL_FORECAST_API_URL,
+    HISTORICAL_FORECAST_HOURLY_FIELDS,
     WEATHER_HOURLY_FIELDS,
     HistoricalAirQualityClient,
+    HistoricalForecastClient,
     HistoricalWeatherClient,
     latest_full_historical_day,
     parse_date,
@@ -142,10 +146,55 @@ def test_historical_air_quality_request_includes_aqi_and_pm25() -> None:
     result = HistoricalAirQualityClient(session=session).fetch(START, START)
 
     params = session.get.call_args.kwargs["params"]
-    assert params["hourly"] == "us_aqi,pm2_5"
+    assert params["hourly"] == "us_aqi,pm2_5,uv_index"
     assert result.records[2]["us_aqi"] == 2.0
     assert result.records[2]["pm2_5_ug_m3"] == 2.0
+    assert result.records[2]["uv_index"] == 2.0
     assert result.availability["us_aqi"] == "available_modeled"
+    assert result.availability["uv_index"] == "available_modeled"
+    assert result.units["uv_index"] == "index"
+
+
+def test_unavailable_historical_air_quality_uv_is_not_filled() -> None:
+    payload = _payload(AIR_QUALITY_HOURLY_FIELDS)
+    payload["hourly"]["uv_index"] = [None] * 24  # type: ignore[index]
+    session, _ = _session_for(payload)
+
+    result = HistoricalAirQualityClient(session=session).fetch(START, START)
+
+    assert result.availability["uv_index"] == "no_historical_values"
+    assert all(row["uv_index"] is None for row in result.records)
+
+
+def test_historical_forecast_preserves_valid_time_and_unknown_issue_metadata() -> None:
+    payload = _payload(HISTORICAL_FORECAST_HOURLY_FIELDS)
+    payload.update({"latitude": 24.85, "longitude": 66.99})
+    session, _ = _session_for(payload)
+
+    result = HistoricalForecastClient(session=session).fetch(START, START)
+    row = result.records[0]
+
+    assert session.get.call_args.args[0] == HISTORICAL_FORECAST_API_URL
+    assert session.get.call_args.kwargs["params"]["hourly"] == (
+        "precipitation_probability"
+    )
+    assert row["forecast_valid_timestamp_utc"] == row["timestamp_utc"]
+    assert row["forecast_issued_at_utc"] is None
+    assert row["forecast_run_id"] is None
+    assert row["forecast_lead_hours"] is None
+    assert row["forecast_model_selection"] == "default_best_match"
+    assert row["forecast_api_latitude"] == 24.85
+    assert result.availability["forecast_precipitation_probability_percent"] == (
+        "available_forecast"
+    )
+    assert json.loads(row["forecast_model_metadata"]) == {
+        "model": None,
+        "models": None,
+    }
+    assert "target_precipitation_probability_percent_h01" not in create_targets(
+        result.records
+    )[0]
+    assert "target_rain_occurred_h01" not in create_targets(result.records)[0]
 
 
 @pytest.mark.parametrize(
@@ -211,6 +260,20 @@ def test_alignment_uses_exact_utc_outer_join_and_preserves_source_only_rows() ->
     assert combined[2]["timestamp_utc"] == weather[2]["timestamp_utc"]
     assert info["weather_only_timestamps"] == [weather[0]["timestamp_utc"]]
     assert info["air_quality_only_timestamps"] == []
+
+
+def test_alignment_uses_cloud_aware_air_quality_uv_with_provenance() -> None:
+    weather, air = _source_rows(1)
+    weather[0]["uv_index"] = None
+    air[0]["uv_index"] = 5.9
+    air[0]["source"] = "open-meteo-modeled-air-quality"
+
+    combined, _ = align_hourly(weather, air)
+
+    assert combined[0]["uv_index"] == 5.9
+    assert combined[0]["weather_uv_index"] is None
+    assert combined[0]["air_quality_uv_index"] == 5.9
+    assert combined[0]["uv_index_source"] == "open-meteo-modeled-air-quality"
 
 
 def test_alignment_rejects_duplicate_and_inconsistent_timezone_timestamps() -> None:
@@ -299,7 +362,18 @@ def test_targets_use_exact_future_hours_and_leave_incomplete_tail_missing() -> N
     assert all(
         row["target_temperature_h24"] is None for row in targets[-24:]
     )
+    assert targets[0]["target_rain_occurred_h01"] == 0
     assert targets[0]["target_rain_occurred_h02"] == 1
+
+
+def test_missing_future_precipitation_keeps_rain_occurrence_target_missing() -> None:
+    weather, air = _source_rows(3)
+    weather[1]["precipitation_mm"] = None
+    combined, _ = align_hourly(weather, air)
+
+    targets = create_targets(combined)
+
+    assert targets[0]["target_rain_occurred_h01"] is None
 
 
 def test_features_are_causal_when_future_values_change() -> None:
@@ -362,6 +436,10 @@ def test_quality_report_flags_invalid_values_and_hourly_gaps() -> None:
             "name": "precipitation_probability_percent",
             "status": "no_historical_values",
         }
+    ]
+    assert report["target_definitions"]["rain_occurred"]["threshold_mm"] == 0.0
+    assert "not station-observed" in report["target_definitions"]["rain_occurred"][
+        "source_semantics"
     ]
 
 

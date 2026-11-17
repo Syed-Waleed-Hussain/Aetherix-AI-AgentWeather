@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import LATITUDE, LONGITUDE, TIMEZONE
 
+RAIN_OCCURRENCE_THRESHOLD_MM = 0.0
 METRIC_COLUMNS = (
     "temperature_c",
     "relative_humidity_percent",
@@ -145,9 +146,22 @@ def align_hourly(
             "air_quality_ingested_at_utc": air.get("ingested_at_utc"),
         }
         for column in _WEATHER_COLUMNS:
-            row[column] = _number(weather.get(column))
+            if column != "uv_index":
+                row[column] = _number(weather.get(column))
         for column in _AIR_QUALITY_COLUMNS:
             row[column] = _number(air.get(column))
+        weather_uv = _number(weather.get("uv_index"))
+        air_quality_uv = _number(air.get("uv_index"))
+        row["weather_uv_index"] = weather_uv
+        row["air_quality_uv_index"] = air_quality_uv
+        row["uv_index"] = weather_uv if weather_uv is not None else air_quality_uv
+        row["uv_index_source"] = (
+            weather.get("source")
+            if weather_uv is not None
+            else air.get("source")
+            if air_quality_uv is not None
+            else None
+        )
         combined.append(row)
 
     weather_only = sorted(set(weather_stamps) - set(air_stamps))
@@ -389,7 +403,9 @@ def create_targets(
                     else None
                 )
                 output[f"target_rain_occurred_h{horizon:02}"] = (
-                    int(precipitation > 0) if precipitation is not None else None
+                    int(precipitation > RAIN_OCCURRENCE_THRESHOLD_MM)
+                    if precipitation is not None
+                    else None
                 )
     return result
 
@@ -520,6 +536,28 @@ def data_quality_report(
         "missing_hour_count": len(gaps),
         "quality_issues": issues,
         "target_availability": target_availability(targets),
+        "target_definitions": {
+            "rain_occurred": {
+                "threshold_mm": RAIN_OCCURRENCE_THRESHOLD_MM,
+                "positive_rule": (
+                    f"precipitation_mm > {RAIN_OCCURRENCE_THRESHOLD_MM}"
+                ),
+                "missing_rule": "Missing future precipitation produces a missing target.",
+                "source_semantics": "Historical weather reanalysis/model proxy, not station-observed truth.",
+            }
+        },
+        "metric_provenance": {
+            "uv_index": (
+                "Open-Meteo Air Quality API hourly uv_index, cloud-aware; "
+                "uv_index_clear_sky is not used. Historical weather archive "
+                "value is preferred only when it is present."
+            ),
+            "rain_occurred": (
+                f"Derived from historical weather precipitation_mm > "
+                f"{RAIN_OCCURRENCE_THRESHOLD_MM} mm; this is a reanalysis/model "
+                "proxy, not station-observed ground truth."
+            ),
+        },
         "feature_schema": sorted(
             key
             for key in targets[0]
@@ -531,9 +569,22 @@ def data_quality_report(
             "The historical weather archive is reanalysis/model data, not station-only observations.",
             "Air-quality values, including US AQI and PM2.5, are modeled estimates rather than direct observations.",
             "Historical fields with all-null arrays, including precipitation probability or UV when unavailable, remain missing and are not given targets.",
+            "Rain-occurrence labels are derived from historical weather reanalysis precipitation, not station-observed ground truth.",
             "Wind direction targets are sine/cosine components to preserve circularity.",
         ],
     }
+
+
+def add_historical_forecast_information(
+    report: dict[str, Any], manifest: dict[str, Any] | None = None
+) -> None:
+    """Keep archived forecast provenance distinct from observation features."""
+    summary = manifest.get("report_summary") if manifest is not None else None
+    report["historical_forecast_information"] = (
+        summary
+        if isinstance(summary, dict)
+        else {"status": "not_ingested", "used_as_feature": False}
+    )
 
 
 def build_feature_dataset(
@@ -563,6 +614,7 @@ def build_feature_dataset(
         requested_start_date,
         requested_end_date,
     )
+    add_historical_forecast_information(report)
     returned_ranges = {
         "weather": _source_local_date_range(weather_rows),
         "air_quality": _source_local_date_range(air_quality_rows),

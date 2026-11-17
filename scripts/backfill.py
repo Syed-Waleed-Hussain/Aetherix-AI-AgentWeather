@@ -3,13 +3,16 @@
 import argparse
 import json
 import sys
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from aetherix_weather.api import OpenMeteoAPIError
 from aetherix_weather.config import LATITUDE, LONGITUDE, TIMEZONE
-from aetherix_weather.dataset import build_feature_dataset
+from aetherix_weather.dataset import (
+    add_historical_forecast_information,
+    build_feature_dataset,
+)
 from aetherix_weather.historical import (
     AIR_QUALITY_HOURLY_FIELDS,
     WEATHER_HOURLY_FIELDS,
@@ -110,6 +113,24 @@ def _report_markdown(report: dict[str, Any]) -> str:
     lines.extend(
         f"- {item['name']}: {item['status']}" for item in unavailable
     )
+    forecast_info = report.get("historical_forecast_information", {})
+    if forecast_info.get("status") != "not_ingested":
+        lines.extend(
+            [
+                "",
+                "## Separate historical forecast information",
+                "",
+                f"- Probability values: "
+                f"{forecast_info.get('probability_values_available', 0)}/"
+                f"{forecast_info.get('record_count', 0)}; not observed rainfall.",
+                f"- Model/run identity: {forecast_info.get('model_identity_available')}; "
+                f"issue time: {forecast_info.get('forecast_issue_time_available')}; "
+                f"lead time: {forecast_info.get('lead_time_available')}.",
+                "- Used as a feature: "
+                f"{forecast_info.get('used_as_feature', False)}.",
+                f"- {forecast_info.get('exclusion_reason', '')}",
+            ]
+        )
     coverage_limitations = report.get("coverage_limitations", [])
     lines.extend(
         [
@@ -126,14 +147,24 @@ def _report_markdown(report: dict[str, Any]) -> str:
             f"- {item['source']}: requested {item['requested']}; "
             f"returned {item['returned']}."
         )
+    quality_issues = report.get("quality_issues", [])
+    lines.extend(["", "## Quality issues", ""])
+    if quality_issues:
+        lines.extend(
+            f"- **{issue['severity']} — {issue['code']}:** {issue['detail']}"
+            for issue in quality_issues
+        )
+    else:
+        lines.append("No issues reported.")
     lines.extend(
         [
             "",
             "## Sources and limitations",
             "",
             "- Weather is Open-Meteo reanalysis/model data; air quality is modeled CAMS data.",
-            "- Historical precipitation probability is unavailable and is not fabricated.",
+            "- Historical-weather precipitation probability is missing; archived forecasts are stored separately and excluded.",
             "- Missing rainfall and AQI values remain missing; default forward-fill is disabled.",
+            f"- Rain-occurrence label: precipitation exceeds {report['target_definitions']['rain_occurred']['threshold_mm']} mm; reanalysis proxy, not station ground truth.",
             "- Wind direction targets use sine/cosine components.",
             "",
             "See `quality_report.json` for detailed gaps, missing percentages, and target availability.",
@@ -202,6 +233,10 @@ def main(argv: list[str] | None = None) -> int:
             requested_start_date=start.isoformat(),
             requested_end_date=end.isoformat(),
         )
+        forecast_manifest = _read_manifest(
+            raw_dir / "historical_forecast_manifest.json"
+        )
+        add_historical_forecast_information(report, forecast_manifest)
         schema_changes = []
         prior_schemas = previous_manifest.get("source_schemas", {})
         for source, fields in current_schemas.items():
@@ -265,12 +300,23 @@ def main(argv: list[str] | None = None) -> int:
                     "endpoint": "https://archive-api.open-meteo.com/v1/archive",
                     "description": "Historical weather reanalysis/model estimates",
                     "requested_hourly_variables": list(WEATHER_HOURLY_FIELDS),
+                    "returned_grid_coordinates": {
+                        "latitude": weather.records[0]["api_latitude"],
+                        "longitude": weather.records[0]["api_longitude"],
+                    },
                 },
                 "air_quality": {
                     "url": "https://open-meteo.com/en/docs/air-quality-api",
                     "endpoint": "https://air-quality-api.open-meteo.com/v1/air-quality",
-                    "description": "Modeled CAMS air-quality estimates, not direct observations",
+                    "description": (
+                        "Modeled US AQI/PM2.5 and hourly cloud-aware UV index; "
+                        "not local station observations"
+                    ),
                     "requested_hourly_variables": list(AIR_QUALITY_HOURLY_FIELDS),
+                    "returned_grid_coordinates": {
+                        "latitude": air_quality.records[0]["api_latitude"],
+                        "longitude": air_quality.records[0]["api_longitude"],
+                    },
                 },
             },
             "availability": availability,

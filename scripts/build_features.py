@@ -6,7 +6,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from aetherix_weather.dataset import build_feature_dataset
+from aetherix_weather.dataset import (
+    add_historical_forecast_information,
+    build_feature_dataset,
+)
 from aetherix_weather.storage import (
     read_csv,
     write_csv_atomic,
@@ -57,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
             requested_start_date=requested.get("start", ""),
             requested_end_date=requested.get("end", ""),
         )
+        forecast_manifest_path = raw_dir / "historical_forecast_manifest.json"
+        forecast_manifest = _read_manifest(forecast_manifest_path)
+        add_historical_forecast_information(report, forecast_manifest)
         current_feature_schema = report["feature_schema"]
         previous_feature_schema = manifest.get("feature_schema")
         if (

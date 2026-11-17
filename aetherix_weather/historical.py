@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import json
 from math import isfinite
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,6 +19,7 @@ from .config import (
 )
 
 ARCHIVE_WEATHER_API_URL = "https://archive-api.open-meteo.com/v1/archive"
+HISTORICAL_FORECAST_API_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 HISTORICAL_SAFETY_LAG_DAYS = 6
 WEATHER_HOURLY_FIELDS = (
     "temperature_2m",
@@ -28,7 +30,8 @@ WEATHER_HOURLY_FIELDS = (
     "wind_direction_10m",
     "uv_index",
 )
-AIR_QUALITY_HOURLY_FIELDS = ("us_aqi", "pm2_5")
+AIR_QUALITY_HOURLY_FIELDS = ("us_aqi", "pm2_5", "uv_index")
+HISTORICAL_FORECAST_HOURLY_FIELDS = ("precipitation_probability",)
 
 _WEATHER_COLUMN_NAMES = {
     "temperature_2m": "temperature_c",
@@ -42,7 +45,10 @@ _WEATHER_COLUMN_NAMES = {
 _AIR_QUALITY_COLUMN_NAMES = {
     "us_aqi": "us_aqi",
     "pm2_5": "pm2_5_ug_m3",
+    "uv_index": "uv_index",
 }
+
+
 @dataclass(frozen=True)
 class HistoricalDataset:
     """Normalized source rows and provenance for one historical API response."""
@@ -168,6 +174,9 @@ def _normalise_historical_payload(
             "source_timestamp": source_times[index],
             "source": source,
             "ingested_at_utc": ingestion_time,
+            "api_latitude": payload.get("latitude"),
+            "api_longitude": payload.get("longitude"),
+            "api_timezone": payload.get("timezone"),
         }
         for field in column_names.values():
             row[field] = None
@@ -330,6 +339,94 @@ class HistoricalAirQualityClient:
             {
                 "us_aqi": "available_modeled",
                 "pm2_5_ug_m3": "available_modeled",
+                "uv_index": "available_modeled",
             },
-            {"us_aqi": "US AQI index", "pm2_5_ug_m3": "µg/m³"},
+            {
+                "us_aqi": "US AQI index",
+                "pm2_5_ug_m3": "µg/m³",
+                "uv_index": "index",
+            },
         )
+
+
+class HistoricalForecastClient:
+    """Fetch stitched historical forecasts; output is not observation truth."""
+
+    def __init__(
+        self,
+        latitude: float = LATITUDE,
+        longitude: float = LONGITUDE,
+        timezone_name: str = TIMEZONE,
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+        session: requests.Session | None = None,
+    ) -> None:
+        if not -90 <= latitude <= 90:
+            raise ValueError("latitude must be between -90 and 90.")
+        if not -180 <= longitude <= 180:
+            raise ValueError("longitude must be between -180 and 180.")
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero.")
+        self.latitude = latitude
+        self.longitude = longitude
+        self.timezone_name = timezone_name
+        self.timeout = timeout
+        self.session = session or requests.Session()
+
+    def fetch(
+        self, start_date: str | date, end_date: str | date
+    ) -> HistoricalDataset:
+        start, end = validate_date_range(start_date, end_date)
+        params = {
+            "latitude": self.latitude,
+            "longitude": self.longitude,
+            "start_date": start.isoformat(),
+            "end_date": end.isoformat(),
+            "hourly": ",".join(HISTORICAL_FORECAST_HOURLY_FIELDS),
+            "timezone": self.timezone_name,
+        }
+        payload = request_json(
+            self.session, HISTORICAL_FORECAST_API_URL, params, self.timeout
+        )
+        dataset = _normalise_historical_payload(
+            payload,
+            "Historical forecast",
+            self.timezone_name,
+            HISTORICAL_FORECAST_HOURLY_FIELDS,
+            {
+                "precipitation_probability": (
+                    "forecast_precipitation_probability_percent"
+                )
+            },
+            "open-meteo-historical-forecast",
+            start,
+            end,
+            {"forecast_precipitation_probability_percent": "available_forecast"},
+            {"forecast_precipitation_probability_percent": "%"},
+        )
+        for row in dataset.records:
+            probability = row["forecast_precipitation_probability_percent"]
+            if probability is not None and not 0 <= probability <= 100:
+                raise OpenMeteoAPIError(
+                    "Historical forecast precipitation probability must be between 0 and 100."
+                )
+            row.update(
+                {
+                    "forecast_valid_timestamp_utc": row["timestamp_utc"],
+                    "forecast_issued_at_utc": payload.get("forecast_issued_at_utc"),
+                    "forecast_run_id": payload.get("run"),
+                    "forecast_api_latitude": payload.get("latitude"),
+                    "forecast_api_longitude": payload.get("longitude"),
+                    "forecast_api_timezone": payload.get("timezone"),
+                    "forecast_model_metadata": json.dumps(
+                        {
+                            "model": payload.get("model"),
+                            "models": payload.get("models"),
+                        },
+                        sort_keys=True,
+                    ),
+                    "forecast_model_selection": "default_best_match",
+                    "forecast_lead_hours": None,
+                    "forecast_value_type": "historical_model_forecast",
+                }
+            )
+        return dataset
