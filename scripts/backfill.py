@@ -1,9 +1,10 @@
 """Download and persist an inclusive historical window for Karachi."""
 
 import argparse
+import hashlib
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +45,58 @@ def _read_manifest(path: Path) -> dict[str, Any]:
 def _local_range(rows: list[dict[str, Any]]) -> dict[str, str | None]:
     if not rows:
         return {"start": None, "end": None}
+    dates = [str(row["timestamp_local"])[:10] for row in rows]
     return {
-        "start": rows[0]["timestamp_local"][:10],
-        "end": rows[-1]["timestamp_local"][:10],
+        "start": min(dates),
+        "end": max(dates),
     }
+
+
+def _stored_availability(
+    rows: list[dict[str, Any]],
+    response_availability: dict[str, str],
+    modeled: bool,
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for column, response_status in response_availability.items():
+        has_values = any(
+            row.get(column) is not None and row.get(column) != "" for row in rows
+        )
+        if not has_values:
+            result[column] = "no_historical_values"
+        elif modeled:
+            result[column] = "available_modeled"
+        else:
+            result[column] = "available"
+    return result
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _resolve_date_range(
+    days: int | None,
+    start_date: str | None,
+    end_date: str | None,
+    today: date | None = None,
+) -> tuple[date, date]:
+    latest = latest_full_historical_day(today)
+    end = parse_date(end_date) if end_date else latest
+    if start_date:
+        if days is not None:
+            raise ValueError("--start-date and --days cannot be combined.")
+        start = parse_date(start_date)
+    else:
+        requested_days = days if days is not None else 90
+        if requested_days < 1:
+            raise ValueError("--days must be at least 1.")
+        start = end - timedelta(days=requested_days - 1)
+    return validate_date_range(start, end, latest_allowed=latest)
 
 
 def _report_markdown(report: dict[str, Any]) -> str:
@@ -85,12 +134,22 @@ def _report_markdown(report: dict[str, Any]) -> str:
         f"{report['duplicate_timestamps']['weather']}, air quality "
         f"{report['duplicate_timestamps']['air_quality']}",
         f"- Missing hourly timestamps: {report['missing_hour_count']}",
-        "",
-        "## Metric missingness after cleaning",
-        "",
-        "| Metric | Before missing | Before % | After missing | After % |",
-        "| --- | ---: | ---: | ---: | ---: |",
     ]
+    last_ingestion_range = report.get("last_ingestion_date_range")
+    if last_ingestion_range:
+        lines.append(
+            f"- Last ingestion request: {last_ingestion_range['start']} to "
+            f"{last_ingestion_range['end']}"
+        )
+    lines.extend(
+        [
+            "",
+            "## Metric missingness after cleaning",
+            "",
+            "| Metric | Before missing | Before % | After missing | After % |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
     for metric, stats in missing.items():
         before_stats = missing_before[metric]
         lines.append(
@@ -113,6 +172,23 @@ def _report_markdown(report: dict[str, Any]) -> str:
     lines.extend(
         f"- {item['name']}: {item['status']}" for item in unavailable
     )
+    source_coverage = report.get("source_variable_coverage", {})
+    if source_coverage:
+        lines.extend(
+            [
+                "",
+                "## Source variable coverage",
+                "",
+                "| Source | Variable | Available | Missing | Missing % |",
+                "| --- | --- | ---: | ---: | ---: |",
+            ]
+        )
+        for source, details in source_coverage.items():
+            for variable, counts in details.get("variables", {}).items():
+                lines.append(
+                    f"| {source} | {variable} | {counts['available_count']} | "
+                    f"{counts['missing_count']} | {counts['missing_percent']:.2f}% |"
+                )
     forecast_info = report.get("historical_forecast_information", {})
     if forecast_info.get("status") != "not_ingested":
         lines.extend(
@@ -176,7 +252,15 @@ def _report_markdown(report: dict[str, Any]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--days", type=int, default=90, help="Inclusive days to fetch (default: 90).")
+    parser.add_argument(
+        "--days",
+        type=int,
+        help="Inclusive days to fetch (default: 90 when --start-date is omitted).",
+    )
+    parser.add_argument(
+        "--start-date",
+        help="First requested local date; requires no --days and defaults its end to the latest full day.",
+    )
     parser.add_argument(
         "--end-date",
         help="Last requested local date (default: the latest conservatively complete day).",
@@ -189,15 +273,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     args = parser.parse_args(argv)
-    if args.days < 1:
-        parser.error("--days must be at least 1.")
     try:
-        end = parse_date(args.end_date) if args.end_date else latest_full_historical_day()
-        start = end - timedelta(days=args.days - 1)
-        validate_date_range(
-            start,
-            end,
-            latest_allowed=latest_full_historical_day(),
+        start, end = _resolve_date_range(
+            args.days, args.start_date, args.end_date
         )
         if args.max_forward_fill_hours < 0:
             parser.error("--max-forward-fill-hours must be zero or greater.")
@@ -218,7 +296,24 @@ def main(argv: list[str] | None = None) -> int:
         stored_weather = read_csv(weather_path)
         stored_air_quality = read_csv(air_quality_path)
 
-        availability = {**weather.availability, **air_quality.availability}
+        availability = {
+            **_stored_availability(stored_weather, weather.availability, modeled=False),
+            **_stored_availability(
+                stored_air_quality, air_quality.availability, modeled=True
+            ),
+        }
+        returned_ranges = {
+            "weather": _local_range(stored_weather),
+            "air_quality": _local_range(stored_air_quality),
+        }
+        all_stored_dates = [
+            value
+            for date_range in returned_ranges.values()
+            for value in (date_range["start"], date_range["end"])
+            if value is not None
+        ]
+        coverage_start = min([start.isoformat(), *all_stored_dates])
+        coverage_end = max([end.isoformat(), *all_stored_dates])
         current_schemas = {
             "weather": sorted(weather.records[0]) if weather.records else [],
             "air_quality": sorted(air_quality.records[0])
@@ -230,8 +325,8 @@ def main(argv: list[str] | None = None) -> int:
             stored_air_quality,
             max_forward_fill_hours=args.max_forward_fill_hours,
             availability=availability,
-            requested_start_date=start.isoformat(),
-            requested_end_date=end.isoformat(),
+            requested_start_date=coverage_start,
+            requested_end_date=coverage_end,
         )
         forecast_manifest = _read_manifest(
             raw_dir / "historical_forecast_manifest.json"
@@ -264,25 +359,13 @@ def main(argv: list[str] | None = None) -> int:
             )
         if schema_changes:
             report["quality_issues"].extend(schema_changes)
-        report["returned_date_ranges_local"] = {
-            "weather": _local_range(weather.records),
-            "air_quality": _local_range(air_quality.records),
+        report["last_ingestion_date_range"] = {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
         }
-        report["coverage_limitations"] = []
-        for source, data in (
-            ("weather", weather),
-            ("air_quality", air_quality),
-        ):
-            actual = _local_range(data.records)
-            if actual["start"] != start.isoformat() or actual["end"] != end.isoformat():
-                report["coverage_limitations"].append(
-                    {
-                        "source": source,
-                        "requested": {"start": start.isoformat(), "end": end.isoformat()},
-                        "returned": actual,
-                    }
-                )
-        write_csv_atomic(processed_dir / "features.csv", processed)
+        features_path = processed_dir / "features.csv"
+        write_csv_atomic(features_path, processed)
+        report["dataset_version_sha256"] = _sha256_file(features_path)
         write_json_atomic(reports_dir / "quality_report.json", report)
         write_text_atomic(
             reports_dir / "quality_report.md", _report_markdown(report)
@@ -293,7 +376,14 @@ def main(argv: list[str] | None = None) -> int:
             "coordinates": {"latitude": LATITUDE, "longitude": LONGITUDE},
             "timezone": TIMEZONE,
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "requested_date_range": {"start": start.isoformat(), "end": end.isoformat()},
+            "requested_date_range": {
+                "start": coverage_start,
+                "end": coverage_end,
+            },
+            "last_ingestion_date_range": {
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+            },
             "sources": {
                 "weather": {
                     "url": "https://open-meteo.com/en/docs/historical-weather-api",
@@ -312,6 +402,8 @@ def main(argv: list[str] | None = None) -> int:
                         "Modeled US AQI/PM2.5 and hourly cloud-aware UV index; "
                         "not local station observations"
                     ),
+                    "underlying_global_model_temporal_resolution": "3-hourly",
+                    "api_timestamp_resolution": "hourly",
                     "requested_hourly_variables": list(AIR_QUALITY_HOURLY_FIELDS),
                     "returned_grid_coordinates": {
                         "latitude": air_quality.records[0]["api_latitude"],
@@ -330,6 +422,8 @@ def main(argv: list[str] | None = None) -> int:
                 "air_quality": air_quality_total,
                 "processed": len(processed),
             },
+            "source_variable_coverage": report["source_variable_coverage"],
+            "feature_dataset_sha256": report["dataset_version_sha256"],
         }
         write_json_atomic(manifest_path, manifest)
     except (OpenMeteoAPIError, ValueError, OSError, json.JSONDecodeError) as exc:
@@ -338,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(
         f"Backfill complete for {start.isoformat()} through {end.isoformat()} "
-        f"({args.days} requested days)."
+        f"({(end - start).days + 1} requested days)."
     )
     print(
         f"Stored weather rows: {weather_total}; air-quality rows: "

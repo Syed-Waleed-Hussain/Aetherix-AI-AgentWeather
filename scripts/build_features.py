@@ -1,6 +1,7 @@
 """Rebuild model-ready features and 24-hour targets from stored raw CSV files."""
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -17,6 +18,14 @@ from aetherix_weather.storage import (
     write_text_atomic,
 )
 from scripts.backfill import _report_markdown
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _read_manifest(path: Path) -> dict[str, Any]:
@@ -63,6 +72,9 @@ def main(argv: list[str] | None = None) -> int:
         forecast_manifest_path = raw_dir / "historical_forecast_manifest.json"
         forecast_manifest = _read_manifest(forecast_manifest_path)
         add_historical_forecast_information(report, forecast_manifest)
+        last_ingestion_range = manifest.get("last_ingestion_date_range")
+        if last_ingestion_range:
+            report["last_ingestion_date_range"] = last_ingestion_range
         current_feature_schema = report["feature_schema"]
         previous_feature_schema = manifest.get("feature_schema")
         if (
@@ -78,7 +90,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         processed_dir = args.data_dir / "processed"
         reports_dir = args.data_dir / "reports"
-        write_csv_atomic(processed_dir / "features.csv", processed)
+        features_path = processed_dir / "features.csv"
+        write_csv_atomic(features_path, processed)
+        report["dataset_version_sha256"] = _sha256_file(features_path)
         write_json_atomic(reports_dir / "quality_report.json", report)
         write_text_atomic(
             reports_dir / "quality_report.md", _report_markdown(report)
@@ -89,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
                 "returned_date_ranges_local"
             ]
             manifest["coverage_limitations"] = report["coverage_limitations"]
+            manifest["source_variable_coverage"] = report[
+                "source_variable_coverage"
+            ]
+            manifest["feature_dataset_sha256"] = report["dataset_version_sha256"]
             write_json_atomic(raw_dir / "manifest.json", manifest)
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"Feature build failed: {exc}", file=sys.stderr)

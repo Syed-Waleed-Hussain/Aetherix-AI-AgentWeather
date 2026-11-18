@@ -34,6 +34,7 @@ from aetherix_weather.historical import (
     validate_date_range,
 )
 from aetherix_weather.storage import upsert_csv
+from scripts.backfill import _resolve_date_range
 
 START = "2026-01-01"
 LOCAL_ZONE = timezone(timedelta(hours=5))
@@ -213,6 +214,20 @@ def test_date_range_parsing_and_validation(value: object, expected: date) -> Non
 
 def test_latest_historical_date_uses_conservative_six_day_buffer() -> None:
     assert latest_full_historical_day(date(2026, 1, 10)) == date(2026, 1, 4)
+
+
+def test_backfill_accepts_explicit_start_and_end_without_days() -> None:
+    start, end = _resolve_date_range(
+        None, "2024-11-15", "2026-11-11", today=date(2026, 11, 17)
+    )
+
+    assert start == date(2024, 11, 15)
+    assert end == date(2026, 11, 11)
+    assert _resolve_date_range(
+        None, None, None, today=date(2026, 11, 17)
+    ) == (date(2026, 8, 14), date(2026, 11, 11))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _resolve_date_range(90, "2024-11-15", None, today=date(2026, 11, 17))
 
 
 def test_historical_client_rejects_missing_or_malformed_variable_arrays() -> None:

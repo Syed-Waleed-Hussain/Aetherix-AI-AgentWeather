@@ -3,6 +3,7 @@
 import hashlib
 import math
 import platform
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,16 @@ class SplitBoundaries:
     validation_fraction: float
 
 
+@dataclass(frozen=True)
+class RollingFold:
+    """Expanding training window and its following validation interval."""
+
+    name: str
+    train_end: int
+    validation_start: int
+    validation_end: int
+
+
 def chronological_split(
     row_count: int,
     train_fraction: float = 0.70,
@@ -134,6 +145,72 @@ def split_indices(
             boundaries.validation_end, boundaries.row_count, dtype=int
         ),
     }
+
+
+def rolling_origin_folds(
+    row_count: int,
+    fold_count: int = 3,
+    minimum_train_fraction: float = 0.50,
+    max_horizon: int = MAX_HORIZON_HOURS,
+) -> list[RollingFold]:
+    """Build expanding validation folds ending before the final test period."""
+    if fold_count < 1:
+        raise ValueError("fold_count must be at least one.")
+    if not 0 < minimum_train_fraction < 1:
+        raise ValueError("minimum_train_fraction must be between zero and one.")
+    if max_horizon < 1:
+        raise ValueError("max_horizon must be at least one.")
+    boundaries = chronological_split(row_count, max_horizon=max_horizon)
+    test_start = boundaries.validation_end
+    first_origin = int(row_count * minimum_train_fraction)
+    edges = np.linspace(first_origin, test_start, fold_count + 1, dtype=int)
+    if any(
+        following - previous <= max_horizon
+        for previous, following in zip(edges, edges[1:])
+    ):
+        raise ValueError(
+            "Dataset is too short for the requested rolling folds and horizon purge."
+        )
+    return [
+        RollingFold(
+            name=f"fold_{index + 1}",
+            train_end=int(edges[index]),
+            validation_start=int(edges[index]),
+            validation_end=int(edges[index + 1]),
+        )
+        for index in range(fold_count)
+    ]
+
+
+def rolling_fold_indices(
+    fold: RollingFold, horizon: int, timestamps: pd.Series
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return origins whose labels end strictly inside their fold interval."""
+    if not 1 <= horizon <= MAX_HORIZON_HOURS:
+        raise ValueError(f"horizon must be between 1 and {MAX_HORIZON_HOURS}.")
+    issue_times = pd.to_datetime(timestamps, utc=True, errors="raise").reset_index(
+        drop=True
+    )
+    if fold.validation_end >= len(issue_times):
+        raise ValueError("Fold validation_end must be before the final dataset row.")
+    label_times = issue_times + pd.Timedelta(horizon, unit="h")
+    train_candidates = np.arange(fold.train_end, dtype=int)
+    train_indices = train_candidates[
+        (
+            label_times.iloc[train_candidates]
+            < issue_times.iloc[fold.validation_start]
+        ).to_numpy()
+    ]
+    validation_candidates = np.arange(
+        fold.validation_start, fold.validation_end, dtype=int
+    )
+    validation_indices = validation_candidates[
+        (
+            label_times.iloc[validation_candidates]
+            < issue_times.iloc[fold.validation_end]
+        ).to_numpy()
+    ]
+    return train_indices, validation_indices
 
 
 def model_feature_columns(frame: pd.DataFrame) -> list[str]:
@@ -417,6 +494,464 @@ def _metric_row(
     }
 
 
+def _season_name(timestamp: pd.Timestamp) -> str:
+    if timestamp.month in (12, 1, 2):
+        return "winter"
+    if timestamp.month in (3, 4, 5):
+        return "spring"
+    if timestamp.month in (6, 7, 8):
+        return "summer"
+    return "autumn"
+
+
+def _backtest_metric_records(
+    *,
+    fold: RollingFold,
+    task: str,
+    horizon: int,
+    model_name: str,
+    model_status: str,
+    indices: np.ndarray,
+    actual: np.ndarray,
+    predicted: np.ndarray | None,
+    timestamps: pd.Series,
+    seasons: list[str],
+    train_count: int,
+    train_positive: int | None,
+    train_negative: int | None,
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    present_seasons = sorted({seasons[int(index)] for index in indices})
+    for season in ["all", *present_seasons]:
+        mask = (
+            np.ones(len(indices), dtype=bool)
+            if season == "all"
+            else np.array(
+                [seasons[int(index)] == season for index in indices], dtype=bool
+            )
+        )
+        selected_indices = indices[mask]
+        selected_actual = actual[mask]
+        positive = (
+            int(np.count_nonzero(selected_actual == 1))
+            if task == "rain_occurred"
+            else None
+        )
+        negative = (
+            int(np.count_nonzero(selected_actual == 0))
+            if task == "rain_occurred"
+            else None
+        )
+        if task == "rain_occurred":
+            validation_class_status = (
+                "positive_only"
+                if positive and not negative
+                else "negative_only"
+                if negative and not positive
+                else "both_classes"
+            )
+        else:
+            validation_class_status = None
+        row: dict[str, Any] = {
+            "fold": fold.name,
+            "season": season,
+            "metric": task,
+            "horizon_hours": horizon,
+            "model": model_name,
+            "model_status": model_status,
+            "train_rows": train_count,
+            "train_positive": train_positive,
+            "train_negative": train_negative,
+            "validation_rows": len(selected_indices),
+            "validation_positive": positive,
+            "validation_negative": negative,
+            "validation_class_status": validation_class_status,
+            "validation_issue_start_utc": (
+                timestamps.iloc[int(selected_indices[0])].isoformat()
+                if len(selected_indices)
+                else None
+            ),
+            "validation_issue_end_utc": (
+                timestamps.iloc[int(selected_indices[-1])].isoformat()
+                if len(selected_indices)
+                else None
+            ),
+            "selection_metric": _selection_metric(task),
+        }
+        if predicted is not None and len(selected_indices):
+            row.update(
+                _metrics(
+                    task,
+                    selected_actual,
+                    np.asarray(predicted)[mask],
+                )
+            )
+        output.append(row)
+    return output
+
+
+def _rolling_backtest_markdown(
+    records: list[dict[str, Any]],
+    folds: list[RollingFold],
+    issue_times: pd.Series,
+) -> str:
+    lines = [
+        "# Rolling-origin backtest",
+        "",
+        "Each fold expands its training window and validates on the immediately "
+        "following chronological interval. Every target horizon is purged at "
+        "the training and validation boundaries using issue and target times. "
+        "Folds end before the untouched final test interval; no test score is "
+        "used for candidate selection.",
+        "",
+        "Imputers and scalers are fitted within each fold's training-only "
+        "scikit-learn pipeline. The seasonal-naive comparator uses the exact "
+        "previous-day value at target valid time. Rain Brier scores also include "
+        "a training-prevalence climatology reference; rain labels are derived "
+        "from modeled/reanalysis precipitation, not rain-gauge observations. "
+        "Season groups use the UTC month of issue time.",
+        "",
+        "## Fold date ranges",
+        "",
+        "| Fold | Train issue range | Validation issue range |",
+        "| --- | --- | --- |",
+    ]
+    for fold in folds:
+        lines.append(
+            f"| {fold.name} | {issue_times.iloc[0].isoformat()} to "
+            f"{issue_times.iloc[fold.train_end - 1].isoformat()} | "
+            f"{issue_times.iloc[fold.validation_start].isoformat()} to "
+            f"{issue_times.iloc[fold.validation_end - 1].isoformat()} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Rain labels by fold and horizon",
+            "",
+            "| Fold | Horizon | Train positive | Train negative | Validation positive | Validation negative | Validation class status |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | --- |",
+        ]
+    )
+    seen: set[tuple[str, int]] = set()
+    for row in records:
+        if row["metric"] != "rain_occurred" or row["season"] != "all":
+            continue
+        key = (row["fold"], row["horizon_hours"])
+        if key in seen:
+            continue
+        seen.add(key)
+        lines.append(
+            f"| {row['fold']} | {row['horizon_hours']} | "
+            f"{row['train_positive']} | {row['train_negative']} | "
+            f"{row['validation_positive']} | {row['validation_negative']} | "
+            f"{row['validation_class_status']} |"
+        )
+    lines.extend(
+        [
+            "",
+            "The CSV contains per-metric, per-horizon, per-fold and per-season "
+            "scores for the seasonal-naive baseline, Ridge candidates, Random "
+            "Forest, and (for rain) the training-prevalence reference. Folds "
+            "with only one rain class are explicitly marked; their classification "
+            "metrics do not establish event-detection skill.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def run_rolling_backtests(
+    frame: pd.DataFrame,
+    output_dir: Path,
+    fold_count: int = 3,
+    dataset_path: Path | None = None,
+    tasks: tuple[str, ...] | None = None,
+    horizons: tuple[int, ...] | None = None,
+) -> dict[str, Any]:
+    """Evaluate model families on purged expanding windows before final test."""
+    if "timestamp_utc" not in frame.columns:
+        raise ValueError("timestamp_utc is required for rolling-origin backtesting.")
+    working = frame.reset_index(drop=True).copy()
+    timestamps = pd.to_datetime(working["timestamp_utc"], utc=True, errors="raise")
+    if timestamps.duplicated().any() or not timestamps.is_monotonic_increasing:
+        raise ValueError("Rolling backtesting requires unique ordered UTC timestamps.")
+    if "_timestamp_utc" not in working:
+        working["_timestamp_utc"] = timestamps
+    folds = rolling_origin_folds(len(working), fold_count=fold_count)
+    features = model_feature_columns(working)
+    selected_tasks = list(tasks) if tasks is not None else [
+        *REGRESSION_TASKS,
+        "wind_direction_degrees",
+        "rain_occurred",
+    ]
+    selected_horizons = (
+        list(horizons)
+        if horizons is not None
+        else list(range(1, MAX_HORIZON_HOURS + 1))
+    )
+    unsupported_tasks = set(selected_tasks) - {
+        *REGRESSION_TASKS,
+        "wind_direction_degrees",
+        "rain_occurred",
+    }
+    if unsupported_tasks:
+        raise ValueError(f"Unsupported rolling-backtest tasks: {sorted(unsupported_tasks)}")
+    if any(not 1 <= horizon <= MAX_HORIZON_HOURS for horizon in selected_horizons):
+        raise ValueError("Backtest horizons must be between 1 and 24.")
+
+    issue_times = timestamps.reset_index(drop=True)
+    seasons = [_season_name(value) for value in issue_times]
+    output: list[dict[str, Any]] = []
+    started_at = time.monotonic()
+    total_jobs = len(selected_tasks) * len(selected_horizons) * len(folds)
+    completed_jobs = 0
+    print(
+        f"[backtest] Starting {total_jobs} task/horizon/fold jobs "
+        f"({len(selected_tasks)} tasks x {len(selected_horizons)} horizons "
+        f"x {len(folds)} folds)",
+        flush=True,
+    )
+    feature_cache: dict[tuple[str, int, str, tuple[int, ...]], tuple[pd.DataFrame, pd.DataFrame, list[str]]] = {}
+    for task in selected_tasks:
+        for horizon in selected_horizons:
+            targets, target_valid = _target_values(working, task, horizon)
+            for fold in folds:
+                completed_jobs += 1
+                print(
+                    f"[backtest] Job {completed_jobs}/{total_jobs}: task={task} "
+                    f"horizon=h{horizon:02} fold={fold.name}",
+                    flush=True,
+                )
+                train_candidates, validation_candidates = rolling_fold_indices(
+                    fold, horizon, issue_times
+                )
+                train_indices = train_candidates[target_valid[train_candidates]]
+                validation_indices = validation_candidates[
+                    target_valid[validation_candidates]
+                ]
+                if len(train_indices) < 20 or len(validation_indices) == 0:
+                    continue
+                train_targets = targets[train_indices]
+                train_positive = (
+                    int(np.count_nonzero(train_targets == 1))
+                    if task == "rain_occurred"
+                    else None
+                )
+                train_negative = (
+                    int(np.count_nonzero(train_targets == 0))
+                    if task == "rain_occurred"
+                    else None
+                )
+
+                baseline_all = seasonal_naive_values(
+                    working, validation_candidates, horizon, task
+                )
+                valid_for_task = target_valid[validation_candidates]
+                baseline_available = np.isfinite(baseline_all)
+                comparable = valid_for_task & baseline_available
+                evaluation_mask = comparable if comparable.any() else valid_for_task
+                evaluation_indices = validation_candidates[evaluation_mask]
+                if len(evaluation_indices) == 0:
+                    continue
+                actual = targets[evaluation_indices]
+                baseline_values = baseline_all[evaluation_mask]
+                baseline_prediction = (
+                    _direction_components(baseline_values)
+                    if task == "wind_direction_degrees"
+                    else baseline_values
+                )
+                output.extend(
+                    _backtest_metric_records(
+                        fold=fold,
+                        task=task,
+                        horizon=horizon,
+                        model_name="seasonal_naive",
+                        model_status="ok",
+                        indices=evaluation_indices,
+                        actual=actual,
+                        predicted=baseline_prediction,
+                        timestamps=issue_times,
+                        seasons=seasons,
+                        train_count=len(train_indices),
+                        train_positive=train_positive,
+                        train_negative=train_negative,
+                    )
+                )
+
+                training_rain_rate = (
+                    float(np.mean(train_targets))
+                    if task == "rain_occurred"
+                    else None
+                )
+                if task == "rain_occurred":
+                    climatology = np.full(
+                        len(evaluation_indices), training_rain_rate, dtype=float
+                    )
+                    output.extend(
+                        _backtest_metric_records(
+                            fold=fold,
+                            task=task,
+                            horizon=horizon,
+                            model_name="training_climatology",
+                            model_status="ok",
+                            indices=evaluation_indices,
+                            actual=actual,
+                            predicted=climatology,
+                            timestamps=issue_times,
+                            seasons=seasons,
+                            train_count=len(train_indices),
+                            train_positive=train_positive,
+                            train_negative=train_negative,
+                        )
+                    )
+
+                if task == "rain_occurred" and len(np.unique(train_targets)) < 2:
+                    output.extend(
+                        _backtest_metric_records(
+                            fold=fold,
+                            task=task,
+                            horizon=horizon,
+                            model_name="random_forest_classifier",
+                            model_status="skipped_single_class_training",
+                            indices=evaluation_indices,
+                            actual=actual,
+                            predicted=None,
+                            timestamps=issue_times,
+                            seasons=seasons,
+                            train_count=len(train_indices),
+                            train_positive=train_positive,
+                            train_negative=train_negative,
+                        )
+                    )
+                    continue
+
+                train_features = working.loc[train_indices, features]
+                observed_training_features = train_features.notna().any(axis=0)
+                selected_features = observed_training_features[
+                    observed_training_features
+                ].index.tolist()
+                if not selected_features:
+                    raise ValueError(f"No training-observed features for task {task}.")
+                cache_key = (
+                    task,
+                    horizon,
+                    fold.name,
+                    tuple(selected_features),
+                )
+                cached = feature_cache.get(cache_key)
+                if cached is None:
+                    train_features = train_features[selected_features]
+                    validation_features = working.loc[
+                        evaluation_indices, selected_features
+                    ]
+                    cached = (train_features, validation_features, selected_features)
+                    feature_cache[cache_key] = cached
+                train_features, validation_features, _ = cached
+                for candidate_name, alpha in _candidate_names(task):
+                    print(
+                        f"[backtest] model={candidate_name} task={task} "
+                        f"horizon=h{horizon:02} fold={fold.name}",
+                        flush=True,
+                    )
+                    estimator = _fit_candidate(
+                        candidate_name,
+                        alpha,
+                        task,
+                        train_features,
+                        train_targets,
+                    )
+                    prediction = _candidate_predictions(
+                        estimator, task, validation_features
+                    )
+                    output.extend(
+                        _backtest_metric_records(
+                            fold=fold,
+                            task=task,
+                            horizon=horizon,
+                            model_name=candidate_name,
+                            model_status="ok",
+                            indices=evaluation_indices,
+                            actual=actual,
+                            predicted=prediction,
+                            timestamps=issue_times,
+                            seasons=seasons,
+                            train_count=len(train_indices),
+                            train_positive=train_positive,
+                            train_negative=train_negative,
+                        )
+                    )
+                elapsed = time.monotonic() - started_at
+                print(
+                    f"[backtest] Completed job {completed_jobs}/{total_jobs}: "
+                    f"task={task} horizon=h{horizon:02} fold={fold.name} "
+                    f"elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+
+    if not output:
+        raise ValueError("No rolling-origin folds had eligible training and validation rows.")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = output_dir / "rolling_backtest.csv"
+    write_csv_atomic(metrics_path, output)
+    issue_times = pd.to_datetime(working["timestamp_utc"], utc=True)
+    report_path = output_dir / "rolling_backtest.md"
+    write_text_atomic(
+        report_path, _rolling_backtest_markdown(output, folds, issue_times)
+    )
+    metadata_path = output_dir / "rolling_backtest_metadata.json"
+    write_json_atomic(
+        metadata_path,
+        {
+            "fold_count": fold_count,
+            "method": "expanding_window_with_chronological_validation",
+            "horizons_hours": selected_horizons,
+            "season_calendar_timezone": "UTC",
+            "final_test_used": False,
+            "model_config": {
+                "random_seed": 42,
+                "ridge_alphas": [0.1, 1.0, 10.0],
+                "random_forest_n_estimators": 40,
+                "random_forest_max_depth": 10,
+                "random_forest_min_samples_leaf": 4,
+                "random_forest_max_features": "sqrt",
+                "random_forest_n_jobs": 1,
+            },
+            "folds": [
+                {
+                    "name": fold.name,
+                    "train_start_utc": issue_times.iloc[0].isoformat(),
+                    "train_end_utc": issue_times.iloc[fold.train_end - 1].isoformat(),
+                    "validation_start_utc": issue_times.iloc[
+                        fold.validation_start
+                    ].isoformat(),
+                    "validation_end_utc": issue_times.iloc[
+                        fold.validation_end - 1
+                    ].isoformat(),
+                    "train_end_index_exclusive": fold.train_end,
+                    "validation_start_index": fold.validation_start,
+                    "validation_end_index_exclusive": fold.validation_end,
+                }
+                for fold in folds
+            ],
+            "dataset_sha256": (
+                _sha256(dataset_path)
+                if dataset_path is not None and dataset_path.is_file()
+                else None
+            ),
+            "backtest_runtime_seconds": round(time.monotonic() - started_at, 3),
+            "metrics_path": str(metrics_path),
+            "report_path": str(report_path),
+        },
+    )
+    return {
+        "folds": folds,
+        "records": output,
+        "metrics_path": str(metrics_path),
+        "report_path": str(report_path),
+        "metadata_path": str(metadata_path),
+    }
+
+
 def _write_test_predictions(
     frame: pd.DataFrame,
     task: str,
@@ -484,10 +1019,20 @@ def run_experiments(
     dataset_path: Path,
     output_dir: Path,
     manifest_path: Path | None = None,
+    horizons: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Train candidates, select on validation, and evaluate selected models once."""
     if len(frame) < 100:
         raise ValueError("At least 100 hourly rows are required for Day 3 experiments.")
+    evaluation_horizons = (
+        list(horizons)
+        if horizons is not None
+        else list(range(1, MAX_HORIZON_HOURS + 1))
+    )
+    if not evaluation_horizons or any(
+        not 1 <= horizon <= MAX_HORIZON_HOURS for horizon in evaluation_horizons
+    ):
+        raise ValueError("Evaluation horizons must be selected from 1 through 24.")
     working = frame.reset_index(drop=True).copy()
     if "_timestamp_utc" not in working:
         working["_timestamp_utc"] = pd.to_datetime(
@@ -510,9 +1055,23 @@ def run_experiments(
     selected_estimators: dict[str, Pipeline] = {}
     pending_test_evaluations: list[dict[str, Any]] = []
     task_names = [*REGRESSION_TASKS, "wind_direction_degrees", "rain_occurred"]
+    chronological_started_at = time.monotonic()
+    chronological_jobs = len(task_names) * len(evaluation_horizons)
+    chronological_completed = 0
+    print(
+        f"[chronological] Starting {chronological_jobs} metric/horizon jobs "
+        f"({len(task_names)} metrics x {len(evaluation_horizons)} horizons)",
+        flush=True,
+    )
 
     for task in task_names:
-        for horizon in range(1, MAX_HORIZON_HOURS + 1):
+        for horizon in evaluation_horizons:
+            chronological_completed += 1
+            print(
+                f"[chronological] Job {chronological_completed}/{chronological_jobs}: "
+                f"metric={task} horizon=h{horizon:02}",
+                flush=True,
+            )
             indices = split_indices(boundaries, horizon)
             targets, target_valid = _target_values(working, task, horizon)
             train_indices = indices["train"][target_valid[indices["train"]]]
@@ -548,6 +1107,11 @@ def run_experiments(
             )
 
             target_train = targets[train_indices]
+            training_rain_probability = (
+                float(np.mean(target_train))
+                if task == "rain_occurred"
+                else None
+            )
             if task == "rain_occurred":
                 unique_classes = np.unique(target_train.astype(int))
                 if len(unique_classes) < 2:
@@ -584,6 +1148,20 @@ def run_experiments(
                 )
                 task_validation_results.append(baseline_row)
                 all_metrics.append(baseline_row)
+            if task == "rain_occurred":
+                climatology_row = _metric_row(
+                    "validation",
+                    task,
+                    horizon,
+                    "training_climatology",
+                    baseline_actual,
+                    np.full(len(validation_indices), training_rain_probability),
+                    selection_metric,
+                    False,
+                    len(train_indices),
+                )
+                task_validation_results.append(climatology_row)
+                all_metrics.append(climatology_row)
             fitted_candidates: dict[str, Pipeline] = {}
             for candidate_name, alpha in candidate_specs:
                 estimator = _fit_candidate(
@@ -670,6 +1248,8 @@ def run_experiments(
                         if selected_name.startswith("ridge_alpha_")
                         else RANDOM_FOREST_PARAMETERS
                         if "random_forest" in selected_name
+                        else {"method": "training rain-positive prevalence"}
+                        if selected_name == "training_climatology"
                         else {"method": "same hour from previous day"}
                     ),
                 }
@@ -686,6 +1266,7 @@ def run_experiments(
                     "selected_features": selected_features,
                     "train_count": len(train_indices),
                     "selection_metric": selection_metric,
+                    "training_rain_probability": training_rain_probability,
                 }
             )
 
@@ -721,11 +1302,16 @@ def run_experiments(
         if selected_name == "seasonal_naive" and not comparable_test_mask.any():
             continue
         if estimator is None:
-            test_predictions = (
-                _direction_components(baseline_test)
-                if task == "wind_direction_degrees"
-                else baseline_test
-            )
+            if selected_name == "training_climatology":
+                test_predictions = np.full(
+                    len(test_indices), pending["training_rain_probability"]
+                )
+            else:
+                test_predictions = (
+                    _direction_components(baseline_test)
+                    if task == "wind_direction_degrees"
+                    else baseline_test
+                )
         else:
             test_features = working.loc[
                 test_indices, pending["selected_features"]
@@ -763,6 +1349,22 @@ def run_experiments(
                     pending["train_count"],
                 )
             )
+        if task == "rain_occurred":
+            all_metrics.append(
+                _metric_row(
+                    "test",
+                    task,
+                    horizon,
+                    "training_climatology",
+                    test_actual,
+                    np.full(
+                        len(test_indices), pending["training_rain_probability"]
+                    ),
+                    pending["selection_metric"],
+                    selected_name == "training_climatology",
+                    pending["train_count"],
+                )
+            )
         _write_test_predictions(
             working,
             task,
@@ -773,6 +1375,12 @@ def run_experiments(
             baseline_test,
             test_actual,
             prediction_rows,
+        )
+    for horizon in evaluation_horizons:
+        elapsed = time.monotonic() - chronological_started_at
+        print(
+            f"[chronological] Completed horizon=h{horizon:02} elapsed={elapsed:.1f}s",
+            flush=True,
         )
     metrics_path = output_dir / "model_evaluation.csv"
     write_csv_atomic(metrics_path, all_metrics)
@@ -854,6 +1462,7 @@ def run_experiments(
                 "pandas_version": pd.__version__,
                 "scikit_learn_version": sklearn.__version__,
                 "input_feature_count": len(features),
+                "evaluation_horizons_hours": evaluation_horizons,
                 "rain_label_distribution_by_horizon": rain_label_distribution,
                 "input_features": features,
                 "excluded_target_columns": [
@@ -881,6 +1490,7 @@ def run_experiments(
             "test": boundaries.row_count - boundaries.validation_end,
         },
         "input_feature_count": len(features),
+        "evaluation_horizons_hours": evaluation_horizons,
         "rain_label_distribution_by_horizon": rain_label_distribution,
         "evaluation_path": str(metrics_path),
         "prediction_path": str(predictions_path),
@@ -903,7 +1513,9 @@ def _evaluation_markdown(
         "model selection.",
         "",
         "Rain classification uses Brier score, precision, recall, and F1 at a "
-        "0.5 threshold. Wind direction uses circular angular error in degrees; "
+        "0.5 threshold. Validation and test metrics include a training-prevalence "
+        "climatology reference alongside the seasonal-naive comparator. Wind "
+        "direction uses circular angular error in degrees; "
         "R² is intentionally omitted for this circular target and is undefined "
         "for constant target samples.",
         "",

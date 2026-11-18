@@ -102,6 +102,16 @@ reanalysis/model record; the air-quality endpoint returns modeled CAMS data.
 See the linked API documentation for dataset coverage, update cadence, and
 usage terms.
 
+The Historical Weather API supports much older weather reanalysis. The
+Air Quality API's global CAMS archive supports older dates, with the
+documentation describing 3-hourly underlying global model data from August
+2022 and a finer global grid from November 2024. The API response is
+hourly-indexed; hourly timestamps do not mean the underlying AQI model has
+hourly independent source resolution. The common historical range used for
+Day 3.5 begins on 2024-11-15, after a one-day Karachi sample returned AQI,
+PM2.5, and UV values, and ends on the latest complete date. Weather-archive UV
+and precipitation probability remain missing; neither is synthesized.
+
 ## Run a historical backfill
 
 From the repository root:
@@ -116,11 +126,16 @@ Optional arguments:
 python -m scripts.backfill --days 30 --end-date 2026-10-01
 python -m scripts.backfill --days 90 --max-forward-fill-hours 2
 python -m scripts.backfill --days 90 --data-dir .\data
+python -m scripts.backfill --start-date 2024-11-15 --end-date 2026-11-11
 ```
 
 Dates are inclusive. An explicit `--end-date` later than the conservative
-latest-full-day cutoff is rejected. Re-running a range upserts records by exact
-UTC timestamp; it does not append duplicate rows. Successful runs write:
+latest-full-day cutoff is rejected. Use either `--days` or `--start-date`;
+when `--start-date` is supplied without `--end-date`, the latest complete day
+is used. Re-running a range upserts records by exact UTC timestamp; unrelated
+stored dates are retained and duplicate rows are not appended. The manifest
+records both the most recent request and the total stored coverage. Successful
+runs write:
 
 - `data/raw/weather.csv` and `data/raw/air_quality.csv`
 - `data/raw/manifest.json` with sources, units, availability, coverage, and
@@ -133,7 +148,9 @@ UTC timestamp; it does not append duplicate rows. Successful runs write:
 CSV raw rows retain the original API time string (`source_timestamp`), a
 timezone-aware UTC key (`timestamp_utc`), Karachi-local time
 (`timestamp_local`), and the UTC ingestion timestamp. Units and provider
-attribution are maintained in the manifest.
+attribution are maintained in the manifest. The quality report also gives
+per-source per-variable available/missing counts and percentages, including
+source-specific UV availability.
 
 ## Rebuild the feature dataset
 
@@ -290,23 +307,47 @@ does not download data. Optional paths:
 
 ```powershell
 python -m scripts.train_baselines --data-dir .\data --output-dir .\artifacts\day3
+python -m scripts.train_baselines --output-dir .\artifacts\day3_5 --development-run
+```
+
+The second command is the recommended Day 3.5 development run. It preserves the
+older Day 3 artifacts and evaluates representative horizons 1, 6, 12, and 24
+hours. The default policy is chronological validation and final-test
+evaluation for all horizons h01-h24, with three-fold expanding-window
+rolling-origin backtesting limited to representative horizons h01, h06, h12,
+and h24. Use `--backtest-horizons` explicitly to request a rolling-origin
+subset or the optional extensive h01-h24 rolling experiment.
+`--backtest-folds` defaults to three and can be changed explicitly.
+
+For restartable chronological completion, use:
+
+```powershell
+python -m scripts.train_baselines --resume-chronological --chronological-horizons 2 3 4 5 --output-dir .\artifacts\day3_5
+python -m scripts.train_baselines --resume-chronological --chronological-horizons 7 8 9 10 11 --output-dir .\artifacts\day3_5
+python -m scripts.train_baselines --resume-chronological --chronological-horizons 13 14 15 16 17 18 --output-dir .\artifacts\day3_5
+python -m scripts.train_baselines --resume-chronological --chronological-horizons 19 20 21 22 23 --output-dir .\artifacts\day3_5
+python -m scripts.train_baselines --resume-chronological --chronological-horizons 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 --output-dir .\artifacts\day3_5
 ```
 
 It generates:
 
-- `artifacts/day3/eda/eda_report.md` and `dataset_inspection.json`.
+- `artifacts/day3_5/eda/eda_report.md` and `dataset_inspection.json` when using
+  the recommended output directory.
 - PNG charts for hourly temperature, humidity distribution, rainfall and rain
   occurrence, wind speed and circular direction, AQI/PM2.5, UV, missingness and
   correlations, and local time-of-day behavior.
-- `artifacts/day3/model_evaluation.csv` with validation comparisons and final
+- `artifacts/day3_5/model_evaluation.csv` with validation comparisons and final
   test scores by metric, horizon, and model, plus `model_evaluation.md`.
-- `artifacts/day3/selected_models.json` with dataset hashes, feature lists,
+- `artifacts/day3_5/selected_models.json` with dataset hashes, feature lists,
   date ranges, split boundaries, validation selection scores, and estimator
   settings.
-- `artifacts/day3/test_predictions.csv` with explicit UTC issue time, target
+- `artifacts/day3_5/test_predictions.csv` with explicit UTC issue time, target
   time, horizon, selected-model prediction, and seasonal-naive prediction.
-- `artifacts/day3/selected_models.joblib` containing only validation-selected
+- `artifacts/day3_5/selected_models.joblib` containing only validation-selected
   fitted estimators (the seasonal-naive baseline needs no saved estimator).
+- `artifacts/day3_5/rolling_backtest.csv`, `rolling_backtest.md`, and
+  `rolling_backtest_metadata.json` with expanding-window scores by fold,
+  season, metric, and horizon.
 
 ### EDA and input data
 
@@ -321,11 +362,22 @@ feature is dropped when its training segment contains no observed values.
 ### Chronological evaluation and leakage controls
 
 The 70%/15%/15% chronological boundaries are based on issue-time ordering. For
-each forecast horizon `h`, the final `h` issue rows before the train/validation
-boundary and before the validation/test boundary are purged, keeping each
-partition's future labels inside that partition. Rows with missing target
-values are excluded per metric/horizon, not imputed. The test period is scored
-only after all model choices have been made from validation results.
+each forecast horizon `h`, training and validation origins are purged using
+their explicit target valid times, so no label crosses a partition boundary.
+Rows with missing target values are excluded per metric/horizon, not imputed.
+The final 15% test period is scored only after all model choices have been made
+from validation results.
+
+The same command additionally runs three expanding-window folds. Folds begin
+at 50% of the timeline and validate sequentially up to (but never into) the
+final test boundary. Each later training fold includes only history available
+at that fold's origin; fold-local imputers and scalers are fitted on that
+training data alone. Scores are reported for all 24 horizons and grouped by
+UTC meteorological season (DJF, MAM, JJA, SON) when present. The rain report
+includes positive/negative counts for every fold and horizon, flags single
+class validation folds, and compares against both previous-day seasonal naive
+and training-prevalence climatology probabilities. The final test data is not
+used by rolling folds or model selection.
 
 Ridge preprocessing uses a median imputer and standard scaler inside a
 scikit-learn pipeline fitted on training rows only. Random Forest imputers are
@@ -336,78 +388,118 @@ without a baseline value are omitted from like-for-like model comparisons.
 
 Ridge alpha values are compared on validation data. Random Forest regression
 and a probability-producing Random Forest classifier are compared with the
-seasonal-naive baseline over horizons 1–24. Continuous targets use MAE, RMSE,
-and R². Rain occurrence uses Brier score, precision, recall, and F1 at a 0.5
+seasonal-naive baseline over horizons 1–24. Rain probability evaluation also
+includes a training-prevalence reference baseline. Continuous targets use MAE,
+RMSE, and R². Rain occurrence uses Brier score, precision, recall, and F1 at a 0.5
 classification threshold. Wind direction is modeled as sine/cosine components
 and evaluated with circular angular MAE/RMSE; ordinary linear R² is not used
 for this circular target. The precipitation regressor's negative predictions
 are floored at 0 mm. Model selection and test performance are reported per
 metric and horizon; scores from different units are not combined.
 
-This is an initial short-history experiment: 90 days of modeled/reanalysis data
-cannot establish seasonal or year-over-year generalization. Rain labels are a
-reanalysis precipitation proxy rather than rain-gauge ground truth; any
-validation-selected model that loses to the baseline should be retained as a
-negative result, not described as an improvement. LSTM, model registries,
-forecast-probability training, dashboard, and Hopsworks are not included.
+Rain labels are a reanalysis precipitation proxy rather than rain-gauge ground
+truth; any validation-selected model that loses to the baseline should be
+retained as a negative result, not described as an improvement. LSTM, model
+registries, forecast-probability training, dashboard, and Hopsworks are not
+included.
 
 ### Actual local run and observations
 
-The Day 3 run used the existing **2,160** hourly rows (local dates
-2026-08-14–2026-11-11), 414 processed columns, and **165 numeric candidate
-inputs** before per-training-split removal of all-null features. The source CSV
-also has 240 future-target columns; all were excluded from inputs. There were
-no duplicate or missing UTC hours. Joined UV is available for all rows, while
-archived weather UV and precipitation probability remain 100% missing.
+The Day 3.5 expansion contains **17,448** aligned hourly rows (local dates
+2024-11-15–2026-11-11), 414 processed columns, and **240 future-target
+columns**, all excluded from model inputs. Weather and air-quality source files
+each contain 17,448 rows over the same date range. The common range has no
+duplicate timestamps or missing UTC hours, and the current quality report
+detects no source-range limitation.
+
+Weather temperature, humidity, precipitation, wind speed, and wind direction
+are present for all 17,448 timestamps. Air-quality US AQI, PM2.5, and
+cloud-aware UV are also present for all 17,448 timestamps. Weather-archive UV
+and precipitation probability remain 100% missing; joined UV comes from the
+Air Quality API. These are modeled products, not Karachi station measurements.
 
 | Metric | Mean | Observed range |
 | --- | ---: | ---: |
-| Temperature | 28.37 °C | 20.1–37.2 °C |
-| Relative humidity | 70.17% | 10–99% |
-| Precipitation | 0.0138 mm/hour | 0–1.8 mm |
-| Wind speed | 11.06 km/h | 0.3–23.2 km/h |
-| US AQI | 82.54 | 59–158 |
-| PM2.5 | 25.58 µg/m³ | 8.6–75 µg/m³ |
-| UV Index | 1.54 | 0–9.75 |
+| Temperature | 26.6039 °C | 9.3–41.2 °C |
+| Relative humidity | 64.3267% | 5–100% |
+| Precipitation | 0.0257 mm/hour | 0–16.5 mm |
+| Wind speed | 10.8366 km/h | 0.2–26.8 km/h |
+| US AQI | 88.955 | 41–165 |
+| PM2.5 | 28.6557 µg/m³ | 3.5–108.7 µg/m³ |
+| UV Index | 1.6175 | 0–11.8 |
 
-Rain occurrence (`precipitation_mm > 0`) was positive for 212/2,160 hours
-(9.81%). All positive rain hours fell in the training period; there were **no
-positive labels in validation or test**. Consequently, the rain test Brier
-score of 0 and zero precision/recall/F1 do **not** demonstrate useful rain
-forecast skill. Precipitation test MAE/RMSE are likewise 0 because the holdout
-periods had no rain; R² is left undefined for a constant target.
+The archive contains **1,238** rain-positive precipitation hours and 16,210
+non-positive hours (strict rule: `precipitation_mm > 0 mm`). The h01 target has
+1,238 positive and 16,209 negative labels, with the final future target missing;
+h24 has 1,238 positive, 16,186 negative, and 24 missing labels. These rainfall
+values are reanalysis/model proxies, not gauge observations.
 
-The base chronological boundaries contain 1,512 train, 324 validation, and 324
-test issue-time rows. Purging and target availability give, at h01, 1,511/323/323
-usable train/validation/test rows; at h24, 1,488/300/300. Models are selected
-per metric/horizon by validation MAE, circular MAE, or Brier score, then the
-test partition is used only for the selected candidate and seasonal-naive
-comparison.
+The first development evaluation used representative horizons 1, 6, 12, and
+24 hours. The full 24-horizon run exceeded the practical CPU budget before
+writing results, so the development run is reported explicitly rather than
+presenting partial full-run outputs. The ordinary CLI still supports every
+horizon; omit `--development-run` to request the full evaluation.
 
-Test MAE (or circular MAE / Brier score for the corresponding targets) at h01
-and h24 was:
+### Day 3.5 continuation status
 
-| Metric | h01 selected (score; seasonal naive) | h24 selected (score; seasonal naive) |
-| --- | --- | --- |
-| Temperature | Ridge α=10 (0.607; 0.889 °C) | Seasonal naive (0.878; 0.878 °C) |
-| Humidity | Ridge α=10 (3.392; 11.904 percentage points) | Seasonal naive (12.240; 12.240 percentage points) |
-| Precipitation | Seasonal naive (0; 0 mm) | Seasonal naive (0; 0 mm) |
-| Wind speed | Ridge α=10 (1.057; 1.837 km/h) | Seasonal naive (1.849; 1.849 km/h) |
-| US AQI | Ridge α=0.1 (2.379; 11.189) | Seasonal naive (10.017; 10.017) |
-| UV Index | Seasonal naive (0.044; 0.044) | Seasonal naive (0.038; 0.038) |
-| Wind direction | Ridge α=10 (19.13°; 22.49° circular MAE) | Seasonal naive (22.65°; 22.65° circular MAE) |
-| Rain occurrence | Seasonal naive (Brier 0; 0) | Seasonal naive (Brier 0; 0) |
+The h01/h24 rolling-origin smoke completed in 983.5 seconds (16.4 minutes) on
+Python 3.12, scikit-learn 1.9.1, with 40-estimator Random Forest pipelines,
+`n_jobs=1`, a 3-fold expanding window, and the dataset SHA-256
+`9c36d4b51e0f5fbd3d961e51d7155ccf6df68e2be985a814976e6e2df05c9da6`. Resume
+validation reused these two horizons in 1.3 seconds without retraining.
+Chronological validation and test evaluation is now complete for h01-h24.
+The missing batches took 334.9 seconds for h02-h05, 835.5 seconds for
+h07-h11, 410.6 seconds for h13-h18, and 559.1 seconds for h19-h23. The
+missing-horizon batches totaled 2,140.1 seconds (35.7 minutes). All 24
+chronological horizons now reuse checkpoints in under one second. The final
+artifact contains 1,267 metric rows and 500,256 test-prediction rows with no
+duplicate horizon/metric/model rows. Rolling-origin results remain complete
+only for h01 and h24 across three folds.
 
-At wind-direction h01, Ridge improves circular MAE but has higher circular RMSE
-(32.72°) than seasonal naive (29.59°). Across all 24 test horizons, a
-validation-selected learned model beat the seasonal-naive selection metric on
-8 humidity horizons and 15 AQI horizons, plus one temperature, two wind-speed,
-and one wind-direction horizon. Random Forest was selected on validation for
-wind speed at h02–h13, but its test MAE was worse than the seasonal baseline at
-11 of those 12 horizons. The seasonal naive was selected for every
-precipitation, UV, and rain-occurrence horizon. These results are short-period
-comparisons, not evidence of year-round generalization.
+The base chronological split was 12,213 training, 2,617 validation, and 2,618
+test issue rows. After horizon purges and valid-target filtering, the test
+metrics use 2,617 rows at h01, 2,612 at h06, 2,606 at h12, and 2,594 at h24.
+The final test contained 260 positive and 2,357 negative rain labels at h01
+(260/2,334 at h24); unlike the original 90-day sample, the holdout includes
+rain events.
 
-The complete 24-horizon MAE/RMSE/R² and classification metrics, test
-predictions, selected-model metadata, and EDA charts are generated locally as
-described above; no model scores are hard-coded into the pipeline.
+Validation-selected-model versus seasonal-naive test errors were:
+
+| Target | h01 selected model MAE | h01 naive MAE | h24 selected model MAE | h24 naive MAE |
+| --- | ---: | ---: | ---: | ---: |
+| Temperature (°C) | 0.284 Ridge | 0.577 | 0.594 Random Forest | 0.578 |
+| Humidity (percentage points) | 1.938 Ridge | 5.765 | 5.394 Random Forest | 5.783 |
+| Precipitation (mm) | 0.0179 seasonal naive | 0.0179 | 0.0180 seasonal naive | 0.0180 |
+| Wind speed (km/h) | 0.775 Ridge | 2.221 | 2.012 Ridge | 2.228 |
+| US AQI | 0.895 Ridge | 7.540 | 7.247 Ridge | 7.579 |
+| UV Index | 0.120 Random Forest | 0.219 | 0.217 seasonal naive | 0.217 |
+| Wind direction (circular MAE, degrees) | 7.050 Ridge | 17.412 | 15.575 Ridge | 17.374 |
+
+Across the four evaluated horizons, validation-selected models beat the
+seasonal-naive test metric at all four horizons for humidity, wind speed, wind
+direction, and AQI; at one of four horizons for temperature and UV; and at
+none for precipitation amount. In particular, temperature h06, h12, and h24
+selected models were worse than the seasonal-naive holdout result. These
+negative results are retained.
+
+Rain classifier test results (threshold 0.5) were:
+
+| Horizon | Brier | Seasonal-naive Brier | Training-climatology Brier | Precision | Recall | F1 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 h | 0.0508 | 0.1169 | 0.0909 | 0.754 | 0.531 | 0.623 |
+| 6 h | 0.0670 | 0.1172 | 0.0911 | 0.732 | 0.231 | 0.351 |
+| 12 h | 0.0674 | 0.1174 | 0.0913 | 0.637 | 0.419 | 0.506 |
+| 24 h | 0.0658 | 0.1180 | 0.0917 | 0.700 | 0.323 | 0.442 |
+
+Rolling smoke coverage was subsequently audited: the saved rolling CSV now
+contains h01 and h24 across all three folds. h06/h12 rolling rows are not
+present in the saved artifact and are not claimed complete. All three saved
+rolling folds contain both rain classes at h01 and h24; fold 1 h01/h24 has only
+nine positive validation events, so its metrics remain especially uncertain.
+The labels remain reanalysis/model precipitation proxies, not rain-gauge
+observations.
+
+The prior `artifacts/day3/` model metadata identifies the earlier 90-day
+dataset hash and must not be interpreted as results for this expanded dataset.
+Expanded-data development outputs are in the ignored `artifacts/day3_5/`
+directory; no scores are hard-coded into the pipeline.

@@ -16,6 +16,9 @@ from aetherix_weather.modeling import (
     _write_test_predictions,
     chronological_split,
     model_feature_columns,
+    rolling_fold_indices,
+    rolling_origin_folds,
+    run_rolling_backtests,
     seasonal_naive_values,
     select_best_candidate,
     split_indices,
@@ -48,6 +51,69 @@ def test_chronological_partitions_purge_each_horizon_label_window() -> None:
     assert splits["train"][-1] < splits["validation"][0]
     assert splits["validation"][-1] < splits["test"][0]
     assert splits["test"][0] == boundaries.validation_end
+
+
+def test_rolling_origin_folds_purge_horizons_and_stop_before_final_test() -> None:
+    frame = _hourly_frame(1000)
+    folds = rolling_origin_folds(len(frame), fold_count=3)
+    final_test_start = chronological_split(len(frame)).validation_end
+    timestamps = pd.to_datetime(frame["timestamp_utc"], utc=True)
+
+    assert len(folds) == 3
+    for fold in folds:
+        train, validation = rolling_fold_indices(fold, 24, timestamps)
+        assert train[-1] + 24 < fold.validation_start
+        assert validation[-1] + 24 < fold.validation_end
+        assert fold.validation_end <= final_test_start
+    assert folds[0].train_end < folds[1].train_end < folds[2].train_end
+
+
+def test_rolling_backtest_reports_rain_climatology_and_class_counts(
+    tmp_path,
+) -> None:
+    frame = _hourly_frame(600)
+    frame["target_rain_occurred_h01"] = (
+        np.arange(len(frame)) % 20 == 0
+    ).astype(float)
+    frame["precipitation_mm"] = (
+        np.arange(len(frame)) % 20 == 0
+    ).astype(float)
+
+    result = run_rolling_backtests(
+        frame,
+        tmp_path,
+        fold_count=3,
+        tasks=("rain_occurred",),
+        horizons=(1,),
+    )
+    all_fold_rows = [
+        row
+        for row in result["records"]
+        if row["season"] == "all"
+    ]
+    climatology_rows = [
+        row for row in all_fold_rows
+        if row["model"] == "training_climatology"
+    ]
+    final_test_start = pd.to_datetime(
+        frame["timestamp_utc"].iloc[chronological_split(len(frame)).validation_end],
+        utc=True,
+    )
+
+    assert {row["fold"] for row in climatology_rows} == {
+        "fold_1",
+        "fold_2",
+        "fold_3",
+    }
+    assert all(row["validation_positive"] > 0 for row in climatology_rows)
+    assert all(row["validation_negative"] > 0 for row in climatology_rows)
+    assert all(row["validation_class_status"] == "both_classes" for row in climatology_rows)
+    assert all(
+        pd.to_datetime(row["validation_issue_end_utc"], utc=True) < final_test_start
+        for row in all_fold_rows
+    )
+    assert (tmp_path / "rolling_backtest.csv").is_file()
+    assert (tmp_path / "rolling_backtest.md").is_file()
 
 
 def test_model_inputs_exclude_targets_and_archived_forecasts() -> None:

@@ -638,6 +638,29 @@ def build_feature_dataset(
                 )
     report["returned_date_ranges_local"] = returned_ranges
     report["coverage_limitations"] = coverage_limitations
+    report["source_variable_coverage"] = {
+        "weather": {
+            "row_count": len(weather_rows),
+            "variables": _source_variable_coverage(
+                weather_rows,
+                (
+                    "temperature_c",
+                    "relative_humidity_percent",
+                    "precipitation_mm",
+                    "precipitation_probability_percent",
+                    "wind_speed_kmh",
+                    "wind_direction_degrees",
+                    "uv_index",
+                ),
+            ),
+        },
+        "air_quality": {
+            "row_count": len(air_quality_rows),
+            "variables": _source_variable_coverage(
+                air_quality_rows, ("us_aqi", "pm2_5_ug_m3", "uv_index")
+            ),
+        },
+    }
     return targets, report
 
 
@@ -653,3 +676,19 @@ def _source_local_date_range(
         "start": min(local_stamps).date().isoformat(),
         "end": max(local_stamps).date().isoformat(),
     }
+
+
+def _source_variable_coverage(
+    rows: list[dict[str, Any]], columns: tuple[str, ...]
+) -> dict[str, dict[str, int | float]]:
+    total = len(rows)
+    coverage: dict[str, dict[str, int | float]] = {}
+    for column in columns:
+        available = sum(_number(row.get(column)) is not None for row in rows)
+        missing = total - available
+        coverage[column] = {
+            "available_count": available,
+            "missing_count": missing,
+            "missing_percent": round(missing * 100 / total, 2) if total else 0.0,
+        }
+    return coverage
