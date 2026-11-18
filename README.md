@@ -27,7 +27,8 @@ python -m pip install -r requirements.txt
 
 Day 1 and Day 2 use the Python standard library plus `requests`; Day 3 adds
 Pandas, Matplotlib, and scikit-learn for local analysis and CPU-only models.
-Tests use `pytest`. Generated `data/` and `artifacts/` files are ignored by Git.
+Day 4A adds statsmodels for a local statistical forecasting experiment. Tests
+use `pytest`. Generated `data/` and `artifacts/` files are ignored by Git.
 
 ## Day 2 architecture
 
@@ -503,3 +504,88 @@ The prior `artifacts/day3/` model metadata identifies the earlier 90-day
 dataset hash and must not be interpreted as results for this expanded dataset.
 Expanded-data development outputs are in the ignored `artifacts/day3_5/`
 directory; no scores are hard-coded into the pipeline.
+
+## Day 4A: statistical time-series forecasting
+
+Day 4A adds a separate, prespecified univariate SARIMAX implementation; it does
+not replace the Day 3.5 selected models. The primary temperature model is
+SARIMAX(1,0,0) × (1,0,0,24) with a constant trend, fitted once with a 40
+iteration cap. Its parameters are fit only on the 24-hour-purged training
+segment (12,189 observations). For each forecast issue time, the filtered
+state is advanced only using observed values available through that issue
+time, then a single vector forecasts up to 24 hours. Validation and final test
+are kept chronological and are never used to fit parameters.
+
+### Reproduction
+
+Run commands from the repository root in the activated Python 3.12 environment:
+
+```powershell
+# Initial capped temperature pilot (168 issue times per split)
+python -m scripts.run_statistical_experiment --metric temperature_c --horizons 1 6 12 24 --output-dir artifacts/day4a/pilot
+
+# Full-period temperature evaluation for all 24 horizons
+python -m scripts.run_statistical_experiment --metric temperature_c --horizons 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 --full-periods --output-dir artifacts/day4a/temperature
+
+# Bounded additional-metric pilots
+python -m scripts.run_statistical_experiment --metric relative_humidity_percent --output-dir artifacts/day4a/relative_humidity_pilot
+python -m scripts.run_statistical_experiment --metric wind_speed_kmh --output-dir artifacts/day4a/wind_speed_pilot
+python -m scripts.run_statistical_experiment --metric us_aqi --output-dir artifacts/day4a/us_aqi_pilot
+python -m scripts.run_statistical_experiment --metric uv_index --nonseasonal --output-dir artifacts/day4a/uv_nonseasonal_pilot
+```
+
+The CLI checks the processed dataset SHA-256 against the saved Day 3.5
+metadata before running. It writes forecasts with issue time, target time,
+horizon, metric, model/version, and split; evaluation CSV/Markdown; a
+Day 3.5 model-comparison CSV/Markdown; joblib model; and metadata including
+dataset, feature-schema, configuration, statsmodels, fit-runtime, and model
+artifact hashes. Outputs are under ignored `artifacts/day4a/`.
+
+### Actual run and interpretation
+
+The full temperature evaluation completed h01-h24 on the 17,448-row processed
+dataset (SHA-256
+`9c36d4b51e0f5fbd3d961e51d7155ccf6df68e2be985a814976e6e2df05c9da6`). It used
+all eligible validation and test issue times, with matching sample counts
+against Day 3.5 for every horizon. One SARIMAX fit converged in 92.2 seconds;
+the complete evaluation took 443.9 seconds. For h01/h06/h12/h24, SARIMAX test
+MAE/RMSE/R² were respectively 0.238/0.349/0.982, 0.576/0.840/0.896,
+0.627/0.921/0.876, and 0.612/0.909/0.879 °C. Seasonal-naive test MAE at
+those horizons was 0.577, 0.577, 0.578, and 0.578 °C. SARIMAX beat the naive
+MAE at h01-h06 (6/24 horizons), but not h07-h24; it is not a generally better
+24-hour model. The saved Ridge/Random Forest model selected using validation
+was also better than SARIMAX at h12 and h24. Full metrics and same-sample
+comparisons are in `artifacts/day4a/temperature/`.
+
+| Split | Horizon | SARIMAX MAE / RMSE / R² | Naive MAE | Validation-selected Day 3.5 model (MAE) |
+| --- | ---: | ---: | ---: | --- |
+| Validation | h01 | 0.230 / 0.331 / 0.981 | 0.590 | Ridge (0.249) |
+| Validation | h06 | 0.565 / 0.842 / 0.874 | 0.589 | Random Forest (0.585) |
+| Validation | h12 | 0.662 / 0.990 / 0.823 | 0.587 | Ridge (0.587) |
+| Validation | h24 | 0.721 / 1.066 / 0.795 | 0.589 | Random Forest (0.553) |
+| Test | h01 | 0.238 / 0.349 / 0.982 | 0.577 | Ridge (0.284) |
+| Test | h06 | 0.576 / 0.840 / 0.896 | 0.577 | Random Forest (0.632) |
+| Test | h12 | 0.627 / 0.921 / 0.876 | 0.578 | Ridge (0.597) |
+| Test | h24 | 0.612 / 0.909 / 0.879 | 0.578 | Random Forest (0.594) |
+
+Bounded 168-origin-per-split exploratory pilots also ran for humidity, wind
+speed, and US AQI using daily-seasonal SARIMAX; fit times were 62.5, 50.5, and
+110.5 seconds, respectively. Their full CLI runtimes were 151.3, 140.0, and
+196.7 seconds. A seasonal UV fit failed to converge within the 40-iteration
+cap; a separately identified nonseasonal SARIMAX(1,0,0) UV pilot converged in
+5.1 seconds (74.9 seconds total). These capped pilots are exploratory, not
+full-period comparisons: their 168 issue times do not match the saved full
+period baseline samples. Precipitation amount (intermittent/zero-inflated),
+wind direction (circular), and rain occurrence (binary) are intentionally not
+modeled by this univariate Gaussian SARIMAX experiment. The Day 3.5 models
+remain authoritative for those targets and the existing rain classification.
+
+Statsmodels fitting is sequential and bounded; no automatic order search is
+performed. Forecasts assume a regular hourly series and stable AR dynamics.
+Historical API values are modeled/reanalysis estimates, not direct station
+observations. The first experiment artifacts serialized full statsmodels
+results (~1.39 GiB per seasonal model); these existing files were preserved.
+The implementation now writes compact parameter-and-training-history
+artifacts, and `load_sarimax_artifact` reconstructs their filtered state
+without optimizer refitting. No statistical model is automatically promoted
+to production.
