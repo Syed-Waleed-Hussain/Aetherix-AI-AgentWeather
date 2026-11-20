@@ -23,6 +23,7 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python -m pip install --index-url https://download.pytorch.org/whl/cpu -r requirements-day4b-cpu.txt
 ```
 
 Day 1 and Day 2 use the Python standard library plus `requests`; Day 3 adds
@@ -104,6 +105,83 @@ See the linked API documentation for dataset coverage, update cadence, and
 usage terms.
 
 The Historical Weather API supports much older weather reanalysis. The
+## Day 4B: lightweight PyTorch LSTM temperature forecast
+
+Day 4B adds a CPU-only PyTorch 48-hour to 24-hour temperature forecast. The
+experiment uses 17 issue-time features, including observed weather variables,
+calendar cycles, and 24/48-hour temperature context. Target columns and
+archived forecast-provider data are excluded from inputs.
+
+Architecture and settings:
+
+- Input sequence: 48 hourly observations, shape `(batch, 48, 17)`
+- LSTM: 1 layer, hidden size 32, batch first
+- Dense output: 24 temperature values
+- Optimizer: Adam, learning rate 0.001
+- Loss: MSE
+- Batch size: 32
+- Maximum epochs: 15
+- Early stopping patience: 3
+- Random seed: 42
+- CPU threads: 2
+- PyTorch: 2.6.0+cpu
+- Python: 3.12.10
+
+The processed dataset has 17,448 UTC rows. The 70/15/15 chronological
+boundaries are rows 12,213 and 14,830. LSTM origins reserve 24 future hours,
+so the test partition contains 2,594 sequences. Each origin uses only rows
+ending at or before the issue timestamp, and target timestamps are issue + 1
+through issue + 24 hours. Training-only median imputation and standard scaling
+are fitted only on training sequences.
+
+The two-epoch pilot completed in 8.5 seconds with finite losses
+(train 0.217815 to 0.053487; validation 0.041602 to 0.033957). Full training
+completed 13 epochs before early stopping in 73.4 seconds; epoch 10 was the
+best validation checkpoint. Final unscaled validation loss was not recorded,
+but the best scaled MSE was 0.029212. Final checkpoint epoch 13 scaled train
+loss was 0.026091 and validation loss was 0.029432.
+
+Test MAE/RMSE/R2 for the 2,594 common test issues:
+
+| Horizon | LSTM MAE | LSTM RMSE | LSTM R2 |
+| ---: | ---: | ---: | ---: |
+| h01 | 0.464273 | 0.661348 | 0.934197 |
+| h06 | 0.717498 | 1.055184 | 0.834833 |
+| h12 | 0.773972 | 1.119674 | 0.816126 |
+| h24 | 0.731122 | 1.058023 | 0.835665 |
+
+On the exact same 2,594 issue timestamps, seasonal-naive MAE was 0.572860
+(h01), 0.573747 (h06), 0.574942 (h12), and 0.578296 (h24). Ridge selected
+MAE was 0.283505 h01, 0.596326 h12, and was not selected in the existing
+production h24 comparison. Random Forest MAE was 0.630725 h06 and 0.593870
+h24. Existing SARIMAX h24 MAE was 0.612260. Therefore the LSTM beat neither
+naive nor Ridge in this experiment and also did not beat the existing h24
+Random Forest or SARIMAX comparisons.
+
+Artifacts are written to `artifacts/day4b/`:
+
+- `lstm_checkpoint.pt`: best model state and reproducibility metadata
+- `lstm_per_horizon.csv`: test metrics h01-h24
+- `lstm_test_predictions.csv`: issue, target, actual, and prediction records
+- `model_comparison.csv`: exact-sample classical comparisons
+- `training_loss.png`
+- `actual_vs_predicted_h01.png`
+- `per_horizon_mae.png`
+
+Reproduce with the project virtual environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.train_lstm --pilot-only --pilot-epochs 2 --epochs 15
+.\.venv\Scripts\python.exe -m scripts.train_lstm --skip-pilot --epochs 15 --patience 3
+.\.venv\Scripts\python.exe -m scripts.train_lstm --evaluate-only
+.\.venv\Scripts\python.exe -m pytest -q
+```
+
+Limitations: only temperature is trained in this phase; the 17-feature schema
+is intentionally small; CPU training used a fixed 48/24 split and 13 completed
+epochs; no hyperparameter search or GPU setup was used. The LSTM prediction
+quality is worse than seasonal-naive and Ridge at several horizons, so it is
+not automatically promoted over existing production candidates.
 Air Quality API's global CAMS archive supports older dates, with the
 documentation describing 3-hourly underlying global model data from August
 2022 and a finer global grid from November 2024. The API response is
