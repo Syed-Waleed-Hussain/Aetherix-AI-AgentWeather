@@ -1,0 +1,2 @@
+hopsworks[python]==5.2.3
+python-dotenv==1.1.1
