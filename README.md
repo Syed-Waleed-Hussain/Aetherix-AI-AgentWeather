@@ -3,8 +3,9 @@
 A free, local-first Karachi weather and air-quality forecasting project. Day 1
 provides live Open-Meteo forecast clients. Day 2 adds historical data ingestion,
 timestamp alignment, data-quality reporting, causal feature engineering, and
-24-hour prediction targets. No API key, paid service, database, or generated
-training data is required.
+24-hour prediction targets. Day 6 runs four local LangGraph agents and saves
+their decisions in SQLite. The default workflow requires no API key or paid
+service.
 
 Open-Meteo historical weather values are reanalysis/model estimates.
 Air-quality and AQI values are modeled CAMS estimates, not direct sensor
@@ -418,6 +419,69 @@ direction). Test scores are for reporting. The Day 5C manifest retains all
 - [Hopsworks 5.2 Feature Group API](https://docs.hopsworks.ai/5.2/python-api/hsfs/feature_group/)
 - [Hopsworks 5.2 Model Registry](https://docs.hopsworks.ai/5.2/user_guides/mlops/)
 - [Hopsworks Free-plan pricing](https://www.hopsworks.ai/pricing)
+
+## Day 6: Four-agent LangGraph workflow
+
+```mermaid
+flowchart TD
+    S([Start]) --> F[Forecast Agent]
+    F --> A[Alert Agent]
+    A --> R[Weather Report Agent]
+    R --> D[Drift Detection Agent]
+    D --> E([End])
+```
+
+The graph runs once from start to end. Each agent writes a JSON state snapshot
+and an audit decision to `outputs/agents/decisions.sqlite3`. If forecasting
+fails, the Alert Agent records a skip and the Report Agent shows unavailable
+coverage. Drift monitoring still runs. Report provider and drift errors are
+recorded without discarding valid forecasts and alerts.
+
+| Agent | Responsibility |
+| --- | --- |
+| Forecast | Match the dataset and ordered features to the validation-selected local estimator for each target and hour. Record valid UTC time, unit, provenance, coverage gaps, and any evaluated seasonal fallback. |
+| Alert | Apply inclusive thresholds to available predictions and group adjacent hours of the same severity. Include the threshold, model, and audience-specific precautions. |
+| Weather Report | Summarize verified values and alert windows. The template is the default and also handles provider failures. |
+| Drift Detection | Compare input distributions and missingness with training, and score matured holdout predictions against timestamp-matched reference values. Record a manual retraining review when error thresholds are breached. |
+
+The typed state carries the request ID, city, mode, issue time, horizon, audience,
+weather and AQI inputs, provenance, predictions, gaps, fallbacks, alerts, report,
+drift results, statuses, safe error categories, and decision timestamps.
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.run_agents --city karachi --horizon 24 --output outputs/agents/local.json
+.\.venv\Scripts\python.exe -m scripts.run_agents --synthetic --json
+.\.venv\Scripts\python.exe -m scripts.run_agents --replay <request-id> --json
+```
+
+The local run uses `data/processed/features.csv`, `artifacts/day3_5/` and the
+optional `artifacts/day5c/champion_selection.json`. It forecasts from the latest
+saved issue hour by default. Supply `--issue` with a UTC-offset timestamp for
+a historical issue after model selection. Replay reads stored state without
+running the models again. The synthetic scenario is an offline fixture.
+
+Use `--audience general|outdoor_workers|sensitive_groups` and optionally
+`--thresholds` with JSON such as
+`{"temperature_c":{"elevated":38,"high":42}}`. Alert windows use valid forecast
+timestamps and an exclusive end. These thresholds are application rules.
+
+With an existing free-tier Groq key, set `GROQ_API_KEY` and `GROQ_MODEL` as
+process environment variables and opt in with `--groq-free`. Groq can select
+the order of report sections. All numbers, timestamps, and alerts come
+from local state. Timeouts, rate limits, and invalid responses use the template.
+
+Drift uses up to the latest 168 saved hours. The KS distance threshold is
+0.25 and the absolute missing-rate change threshold is 10 percentage points.
+Matched holdout errors need at least 24 observations per target and horizon.
+They use MAE, Brier score, or circular MAE as appropriate, and flag increases
+at 1.5 times the validation reference or any increase above a zero reference.
+The holdout archive is used for monitoring only. Input shifts can reflect
+seasonality, and a short error window calls for review before retraining.
+
+The current inference bundle is Karachi-only. AQI reference values are modeled
+estimates. Forecasts use the saved historical snapshot, and the cloud sample's
+17-feature projection does not supply the baseline models' full input schema.
+Groq and Hopsworks are optional for running the graph locally.
 
 ## Tests and existing live smoke test
 
