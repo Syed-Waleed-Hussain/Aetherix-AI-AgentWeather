@@ -1,16 +1,21 @@
 import hashlib
 import json
+import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from aetherix_weather import model_registry
+from aetherix_weather.champions import decide_champion
 from aetherix_weather.model_registry import (
     feature_schema_hash,
     prepare_temperature_lstm_metadata,
     select_champion,
 )
+from scripts import prepare_model_registry
 
 
 def _write_registry_fixture(root: Path) -> tuple[Path, Path, Path]:
@@ -136,3 +141,111 @@ def test_champion_selection_requires_comparable_validation_candidates() -> None:
     incompatible = {**worse, "dataset_sha256": "other-dataset"}
     with pytest.raises(ValueError, match="share target"):
         select_champion([better, incompatible])
+
+
+@pytest.mark.parametrize(
+    ("target", "metric"),
+    [("temperature_c", "mae"), ("rain_occurred", "brier_score"),
+     ("wind_direction_degrees", "circular_mae_degrees")],
+)
+def test_horizon_champion_uses_only_compatible_validation_evidence(target, metric):
+    incumbent = {
+        "model_name": "incumbent", "target": target, "horizon_hours": 1,
+        "metric": metric, "dataset_sha256": "dataset", "feature_schema_sha256": "schema",
+        "validation_observations": {"start": "a", "end": "b", "count": 10},
+        "validation_score": 0.2,
+    }
+    better = {**incumbent, "model_name": "new", "validation_score": 0.1, "test_score": 99}
+    for field, value in (
+        ("target", "other"), ("horizon_hours", 2), ("dataset_sha256", "other"),
+        ("feature_schema_sha256", "other"), ("validation_observations", {"count": 9}),
+        ("metric", "scaled_mse"),
+    ):
+        decision = decide_champion(incumbent, [{**better, field: value}])
+        assert decision["champion"] == incumbent
+        assert field in decision["challengers"][0]["reason"]
+    assert decide_champion(incumbent, [better])["champion"] == better
+    assert decide_champion(incumbent, [{**better, "validation_score": 0.2}])["champion"] == incumbent
+
+
+def test_registry_reuses_verified_version_and_aborts_if_metadata_changes(tmp_path, monkeypatch):
+    checkpoint = tmp_path / "lstm_checkpoint.pt"
+    checkpoint.write_bytes(b"temperature weights")
+    metadata = {
+        "model_name": "aetherix_temperature_lstm",
+        "artifact": {"sha256": model_registry.sha256_file(checkpoint)},
+        "validation_metrics": {"scaled_mse": {"value": 0.1}},
+    }
+    metadata_path = tmp_path / "registry_metadata.json"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    schema = {"input_schema": {}, "output_schema": {}}
+    monkeypatch.setattr(
+        model_registry, "_sdk_model_schema", lambda _: SimpleNamespace(to_dict=lambda: schema)
+    )
+    models = []
+    writes = []
+
+    def download(directory):
+        for file in (checkpoint, metadata_path):
+            shutil.copy(file, directory)
+        return directory
+
+    def create_model(name, *, description, metrics, model_schema):
+        assert name == metadata["model_name"]
+
+        def save(path):
+            assert Path(path) == tmp_path
+            version = SimpleNamespace(
+                description=description, training_metrics=metrics, version=1,
+                download=download, model_schema=model_schema.to_dict(),
+            )
+            models.append(version)
+            writes.append(path)
+            return version
+
+        return SimpleNamespace(save=save)
+
+    registry = SimpleNamespace(
+        python=SimpleNamespace(create_model=create_model),
+        get_models=lambda _name: models,
+        get_model=lambda _name, *, version: models[version - 1],
+    )
+    sync = model_registry.sync_registry_candidate
+    assert sync(registry, tmp_path, metadata, execute=False) == (None, False)
+    assert sync(registry, tmp_path, metadata, execute=True) == (1, True)
+    assert sync(registry, tmp_path, metadata, execute=True) == (1, False)
+    metadata_path.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="read-back"):
+        sync(registry, tmp_path, metadata, execute=True)
+    assert len(writes) == 1
+
+
+def test_registry_cli_local_fallback_and_sanitized_cloud_failure(tmp_path, monkeypatch, capsys):
+    artifact = tmp_path / "day4b"
+    artifact.mkdir()
+    (artifact / "lstm_checkpoint.pt").write_bytes(b"local checkpoint")
+    monkeypatch.setattr(prepare_model_registry, "ARTIFACTS", tmp_path)
+    monkeypatch.setattr(prepare_model_registry, "verify_secret_ignored", lambda _: None)
+    monkeypatch.setattr(prepare_model_registry, "_verify_with_local_torch", lambda *_: None)
+    monkeypatch.setattr(
+        prepare_model_registry, "registration_metadata", lambda *_: {"artifact": {"sha256": "hash"}}
+    )
+    monkeypatch.setattr(
+        prepare_model_registry, "build_champion_manifest", lambda *_: {"decisions": []}
+    )
+    with pytest.raises(SystemExit):
+        prepare_model_registry.main(["--execute"])
+    assert prepare_model_registry.main([]) == 0
+    assert (tmp_path / "day5c" / "champion_selection.json").is_file()
+
+    def unavailable():
+        raise ConnectionError("secret-value")
+
+    monkeypatch.setattr(
+        prepare_model_registry, "_connect_to_project",
+        lambda: SimpleNamespace(get_model_registry=unavailable),
+    )
+    assert prepare_model_registry.main(["--check-remote"]) == 1
+    result = capsys.readouterr()
+    assert "ConnectionError" in result.err
+    assert "secret-value" not in (result.err + result.out)

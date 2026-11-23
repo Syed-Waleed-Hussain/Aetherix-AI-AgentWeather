@@ -340,23 +340,7 @@ Attribution and provider details:
 - [Air Quality API](https://open-meteo.com/en/docs/air-quality-api)
 - [Open-Meteo terms and attribution](https://open-meteo.com/en/terms)
 
-## Day 5: Hopsworks read-only connection check
-
-Use the existing Python 3.12 Hopsworks environment with the SDK pinned in
-`requirements-day5-hopsworks.txt`.
-
-```powershell
-.\.venv-hopsworks\Scripts\python.exe -m scripts.hopsworks_connection_check
-```
-
-The project-root `.env` must define `HOPSWORKS_API_KEY`, `HOPSWORKS_PROJECT`,
-and `HOPSWORKS_HOST`. The check loads them with `python-dotenv`, logs in using
-the Python engine, verifies the selected project, and checks Feature Store and
-Model Registry access. It only obtains service handles; it does not read or
-write feature data, create model versions, delete resources, or start services.
-Its output omits credentials and host details.
-
-### Day 5B offline weather Feature Group
+## Day 5: Hopsworks MLOps
 
 `aetherix_hourly_weather_features` v1 is an offline Hudi Feature Group keyed by
 `city_id` (`karachi_pk`) and `event_timestamp` (UTC hourly timestamp). It projects
@@ -366,64 +350,73 @@ observed-hour weather and modeled AQI inputs, calendar cycles, and causal
 identifiers, pipeline source version, and full CSV SHA-256. Forecast targets
 stay in the local training dataset. Lag warm-up values are stored as nulls.
 
-Run both preflights locally. Neither loads credentials or connects to Hopsworks.
+The Day 5B checkpoint verified 24 remote sample rows. A DNS resolution failure
+blocked Day 5C from rechecking the count, schema, registry, and current quota.
+The full upload and LSTM registration are pending approval.
+
+### Feature Store
+
+Run the local plan and the read-only cloud preflight with the existing
+Hopsworks SDK 5.2.3 environment. Cloud commands use the ignored project-root
+`.env` and keep credentials out of their output.
 
 ```powershell
-.\.venv-hopsworks\Scripts\python.exe -m scripts.sync_hopsworks_features --dry-run
-.\.venv-hopsworks\Scripts\python.exe -m scripts.sync_hopsworks_features --sample
+.\.venv-hopsworks\Scripts\python.exe -m scripts.hopsworks_connection_check
+.\.venv-hopsworks\Scripts\python.exe -m scripts.sync_hopsworks_features --full
+.\.venv-hopsworks\Scripts\python.exe -m scripts.sync_hopsworks_features --full --preflight
 ```
 
-After explicit approval, run one sample write of at most 24 complete historical
-rows. The CLI checks any existing group configuration, submits an offline
-upsert, waits for its materialization job, then compares the offline keys,
-timestamps, provenance, and predictor values with the local batch.
+The sample command upserts and verifies up to 24 complete-feature rows.
+Use the write flags only after approval.
 
 ```powershell
 .\.venv-hopsworks\Scripts\python.exe -m scripts.sync_hopsworks_features --sample --execute --confirm-write
 ```
 
-After the sample has passed and the full sync is separately authorized, check
-the project's remaining Free-plan offline storage and compute for four
-materialization batches and read-back queries. The current full storage budget
-is approximately 24.7 MB (four times the CSV-equivalent payload). Pass the
-remaining storage in bytes from the project quota page and confirm the
-Free-plan compute check using `--confirm-free-plan`. No tier change is needed
-to run the preflight.
+The Free plan includes one project with Feature Store and Model Registry
+without a credit card. Check the project's current offline storage and
+compute allowance before a write. Allow four materialization jobs plus
+preflight, per-batch, and final read-back queries. The CLI requires at least
+24,700,648 remaining bytes for this dataset, four times its CSV-equivalent
+payload. This is a planning estimate. Set `$remainingBytes` to the actual
+remaining bytes and run the following command after authorizing the full sync.
 
 ```powershell
-.\.venv-hopsworks\Scripts\python.exe -m scripts.sync_hopsworks_features --full
-# After the quota check, set $remainingBytes to the available offline bytes.
 .\.venv-hopsworks\Scripts\python.exe -m scripts.sync_hopsworks_features --full --execute --confirm-write --confirm-free-plan --free-storage-remaining-bytes $remainingBytes
 ```
 
-Run one sync at a time. A failed full sync can be rerun against the same project
-and dataset. The CLI rechecks checkpointed batches in the offline store and
-retries the first unverified batch by composite key. Progress is written
-under the Git-ignored `outputs/hopsworks_sync/` directory only after read-back.
-If the group schema or a checkpointed batch differs, the run stops for
-inspection.
+Run one sync at a time. The CLI verifies the existing sample and remote rows,
+upserts four deterministic batches by composite key, and checks the entire
+offline group for exactly 17,448 rows. Checkpoints in `outputs/hopsworks_sync/`
+record a batch only after verification. Resume with the same command and
+current quota. Verified materialized batches are reused.
 
-The optional integration test reads an existing sample without writing. Set
-`AETHERIX_HOPSWORKS_LIVE_READ=1` only after an authorized sample has run.
+### Model Registry and champions
 
-```powershell
-.\.venv-hopsworks\Scripts\python.exe -m unittest discover -s tests -p test_hopsworks_live.py
-```
-
-Prepare local Registry metadata from the existing 24-horizon temperature LSTM
-checkpoint and its validation history. The output records the model and
-dataset hashes, ordered inputs, architecture, and comparison with the
-24-hour seasonal-naive baseline on the same validation sequences.
+The existing CPU PyTorch environment verifies the 48-hour, 17-feature LSTM
+input and 24-output forecast. Preparation writes metadata and the champion
+manifest to `artifacts/day5c/`. When cloud access is unavailable, use the local
+CSV and saved models under `artifacts/day3_5/` and `artifacts/day4b/`.
 
 ```powershell
 .\.venv\Scripts\python.exe -m scripts.prepare_model_registry
+.\.venv-hopsworks\Scripts\python.exe -m scripts.prepare_model_registry --check-remote
+# After authorizing the model upload
+.\.venv-hopsworks\Scripts\python.exe -m scripts.prepare_model_registry --execute --confirm-write
 ```
 
-The metadata is written to
-`artifacts/day5b/temperature_lstm_registry_metadata.json`. The command uses
-local artifacts only.
+Registration reuses a verified equivalent version if present. Otherwise it
+uploads the LSTM checkpoint and metadata, then downloads them to verify the
+artifact hash, metrics, and tensor schema. Run one registration at a time.
+
+`champion_selection.json` records a decision per target and horizon. A challenger
+needs compatible validation observations, dataset, feature schema, and a
+strictly lower validation MAE, Brier score (rain), or circular MAE (wind
+direction). Test scores are for reporting. The Day 5C manifest retains all
+192 Day 3.5 selections.
 
 - [Hopsworks 5.2 Feature Group API](https://docs.hopsworks.ai/5.2/python-api/hsfs/feature_group/)
+- [Hopsworks 5.2 Model Registry](https://docs.hopsworks.ai/5.2/user_guides/mlops/)
 - [Hopsworks Free-plan pricing](https://www.hopsworks.ai/pricing)
 
 ## Tests and existing live smoke test

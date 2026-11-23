@@ -90,7 +90,7 @@ def _quiet_sdk_call(action: Callable[[], Any]) -> Any:
         return action()
 
 
-def _connect_to_feature_store() -> Any:
+def _connect_to_project() -> Any:
     try:
         from dotenv import load_dotenv
 
@@ -135,13 +135,23 @@ def _connect_to_feature_store() -> Any:
             raise SyncOperationError(
                 "The connected Hopsworks project does not match HOPSWORKS_PROJECT."
             )
-        return _quiet_sdk_call(project.get_feature_store)
+        return project
     except SyncOperationError:
         raise
     except Exception as exc:
         raise SyncOperationError(
-            f"Hopsworks connection or Feature Store access failed "
+            f"Hopsworks login failed "
             f"({type(exc).__name__})."
+        ) from None
+
+
+def _connect_to_feature_store() -> Any:
+    project = _connect_to_project()
+    try:
+        return _quiet_sdk_call(project.get_feature_store)
+    except Exception as exc:
+        raise SyncOperationError(
+            f"Feature Store access failed ({type(exc).__name__})."
         ) from None
 
 
@@ -256,6 +266,44 @@ def _wait_and_verify_read_back(
     )
 
 
+def _read_offline_group(feature_group: Any) -> pd.DataFrame:
+    try:
+        return _quiet_sdk_call(
+            lambda: feature_group.read(online=False, dataframe_type="pandas")
+        )
+    except Exception as exc:
+        raise SyncOperationError(
+            f"Offline Feature Group read failed ({type(exc).__name__})."
+        ) from None
+
+
+def _verify_existing_history(feature_group: Any, expected: pd.DataFrame) -> pd.DataFrame:
+    actual = _read_offline_group(feature_group)
+    if not isinstance(actual, pd.DataFrame) or not set(FEATURE_COLUMNS).issubset(actual.columns):
+        raise FeatureDataError("Offline Feature Group read-back schema is incomplete.")
+    timestamps = pd.to_datetime(actual["event_timestamp"], utc=True, errors="raise")
+    verify_round_trip(
+        expected.loc[expected["event_timestamp"].isin(timestamps)],
+        actual,
+    )
+    sample = select_sync_rows(expected, sample=True)
+    verify_round_trip(sample, actual.loc[timestamps.isin(sample["event_timestamp"])])
+    return actual.assign(event_timestamp=timestamps)
+
+
+def _get_existing_feature_group(feature_store: Any) -> Any:
+    try:
+        group = _quiet_sdk_call(
+            lambda: feature_store.get_feature_group(FEATURE_GROUP_NAME, version=FEATURE_GROUP_VERSION)
+        )
+    except Exception as exc:
+        raise SyncOperationError(
+            f"Existing Feature Group lookup failed ({type(exc).__name__})."
+        ) from None
+    _verify_feature_group_schema(group)
+    return group
+
+
 def _upsert_and_verify(feature_group: Any, rows: pd.DataFrame) -> None:
     # SDK Avro serialization maps pandas.NA to null, while float NaN stays NaN.
     nullable = {name: "Float64" for name in MODEL_FEATURES if rows[name].isna().any()}
@@ -355,20 +403,33 @@ def _execute_sync(
         raise SyncOperationError("Sample must contain between 1 and 24 rows.")
     completed = _read_progress(progress_path, dataset_hash, len(rows)) if full else set()
     feature_store = _connect_to_feature_store()
-    feature_group = _create_or_reuse_feature_group(feature_store)
     if not full:
+        feature_group = _create_or_reuse_feature_group(feature_store)
         _upsert_and_verify(feature_group, rows)
         print(f"Sample cloud round trip: verified {len(rows)} rows.")
         return
 
+    feature_group = _get_existing_feature_group(feature_store)
+    existing = _verify_existing_history(feature_group, rows)
     for start in range(0, len(rows), FULL_BATCH_SIZE):
         batch = rows.iloc[start : start + FULL_BATCH_SIZE].copy()
-        if start in completed:
-            _wait_and_verify_read_back(feature_group, batch)
-            continue
-        _upsert_and_verify(feature_group, batch)
+        try:
+            if start in completed:
+                _wait_and_verify_read_back(feature_group, batch)
+                continue
+            recovered = existing.loc[existing["event_timestamp"].isin(batch["event_timestamp"])]
+            if len(recovered) == len(batch):
+                verify_round_trip(batch, recovered)
+            else:
+                _upsert_and_verify(feature_group, batch)
+        except SyncOperationError as exc:
+            raise SyncOperationError(
+                f"Batch starting at row offset {start}: {exc} "
+                "Resume with the same full-sync command and current remaining quota."
+            ) from None
         completed.add(start)
         _write_progress(progress_path, dataset_hash, len(rows), completed)
+    verify_round_trip(rows, _read_offline_group(feature_group))
     print(f"Full cloud round trip: verified {len(rows)} rows.")
 
 
@@ -378,6 +439,10 @@ def _build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--sample", action="store_true")
     mode.add_argument("--full", action="store_true")
+    parser.add_argument(
+        "--preflight", action="store_true",
+        help="Inspect the existing offline group and verify its rows without writing.",
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--confirm-write", action="store_true")
     parser.add_argument(
@@ -403,6 +468,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.preflight and (not args.full or args.execute):
+            raise ValueError("--preflight requires --full and runs read-only.")
         validate_execution_request(
             sample=args.sample,
             full=args.full,
@@ -474,6 +541,21 @@ def main(argv: list[str] | None = None) -> int:
     elif args.full:
         print("Free-plan quota: supplied remaining-storage value covers the estimate")
 
+    if args.preflight:
+        try:
+            feature_store = _connect_to_feature_store()
+            group = _get_existing_feature_group(feature_store)
+            print("Remote Feature Group schema verified.")
+            count = len(_verify_existing_history(group, selected))
+        except (SyncOperationError, FeatureDataError) as exc:
+            print(f"Cloud preflight failed: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:
+            print(f"Cloud preflight failed ({type(exc).__name__}).", file=sys.stderr)
+            return 1
+        print(f"Remote offline row count: {count}; sample and all existing rows verified.")
+        return 0
+
     if not args.execute:
         print("Execution: dry run only; no Hopsworks connection or remote writes.")
         if args.sample:
@@ -483,7 +565,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             print(
-                "Planned remote operations: create or reuse the offline-only "
+                "Planned remote operations: verify the existing offline-only "
                 "Feature Group; deterministic upsert batches; checkpoint progress; "
                 "read back and verify every batch."
             )
@@ -497,7 +579,7 @@ def main(argv: list[str] | None = None) -> int:
             progress_path=PROJECT_ROOT / "outputs" / "hopsworks_sync"
             / f"{FEATURE_GROUP_NAME}_v{FEATURE_GROUP_VERSION}.json",
         )
-    except SyncOperationError as exc:
+    except (SyncOperationError, FeatureDataError) as exc:
         print(f"Cloud sync failed: {exc}", file=sys.stderr)
         return 1
     print("Cloud operation completed; local source data was not modified.")

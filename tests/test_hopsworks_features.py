@@ -310,7 +310,9 @@ def test_full_sync_resumes_after_unverified_batch(
     written, verified = [], []
     monkeypatch.setattr(sync, "FULL_BATCH_SIZE", 40)
     monkeypatch.setattr(sync, "_connect_to_feature_store", lambda: None)
-    monkeypatch.setattr(sync, "_create_or_reuse_feature_group", lambda _store: None)
+    monkeypatch.setattr(sync, "_get_existing_feature_group", lambda _store: None)
+    monkeypatch.setattr(sync, "_verify_existing_history", lambda *_args: rows.iloc[:0])
+    monkeypatch.setattr(sync, "_read_offline_group", lambda _group: rows)
     monkeypatch.setattr(
         sync, "_wait_and_verify_read_back", lambda _group, batch: verified.append(batch.index[0])
     )
@@ -330,6 +332,24 @@ def test_full_sync_resumes_after_unverified_batch(
     assert written == [0, 40, 40]
     assert verified == [0]
     assert sync._read_progress(progress, digest, len(rows)) == {0, 40}
+
+
+def test_full_sync_recovers_materialized_rows_and_checks_whole_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = _feature_frame(tmp_path)
+    progress = tmp_path / "progress.json"
+    digest = rows["source_dataset_sha256"].iloc[0]
+    sample = select_sync_rows(rows, sample=True)
+    remote = iter((rows, pd.concat([rows, sample])))
+    monkeypatch.setattr(sync, "_connect_to_feature_store", lambda: None)
+    monkeypatch.setattr(sync, "_get_existing_feature_group", lambda _store: None)
+    monkeypatch.setattr(sync, "_read_offline_group", lambda _group: next(remote))
+    monkeypatch.setattr(sync, "_upsert_and_verify", lambda *_: pytest.fail("Unexpected upsert"))
+
+    with pytest.raises(FeatureDataError, match="duplicate primary keys"):
+        sync._execute_sync(rows, digest, full=True, progress_path=progress)
+    assert sync._read_progress(progress, digest, len(rows)) == {0}
 
 
 def test_read_back_retries_until_visible_and_fails_on_incorrect_values(

@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import numpy as np
@@ -253,3 +254,138 @@ def prepare_temperature_lstm_metadata(
         },
         "registered": False,
     }
+
+
+def registration_metadata(
+    dataset_path: Path, training_path: Path, checkpoint_path: Path
+) -> dict[str, Any]:
+    prepared = prepare_temperature_lstm_metadata(dataset_path, training_path, checkpoint_path)
+    training = _read_json(training_path)
+    candidate = prepared["candidates"][0]
+    candidate.pop("version")
+    features = candidate["feature_schema"]
+    config = candidate["architecture"]
+    if (
+        candidate["horizons_hours"] != list(range(1, 25))
+        or config["input_size"] != len(features)
+        or config["sequence_length"] != 48
+        or set(features) - set(pd.read_csv(dataset_path, nrows=0).columns)
+    ):
+        raise ValueError("Temperature LSTM input/output signature does not match the dataset.")
+    test = [row for row in training["evaluation"] if row["split"] == "test"]
+    if (
+        sorted(row["horizon_hours"] for row in test) != candidate["horizons_hours"]
+        or any(
+            row["metric"] != "temperature_c" or row["n"] <= 0
+            or not all(math.isfinite(row[key]) for key in ("mae", "rmse", "r2"))
+            or min(row["mae"], row["rmse"]) < 0
+            for row in test
+        )
+    ):
+        raise ValueError("Temperature LSTM test evaluation is incomplete or invalid.")
+    candidate["test_metrics"] = sorted(
+        ({key: row[key] for key in ("horizon_hours", "mae", "rmse", "r2", "n")}
+         for row in test),
+        key=lambda row: row["horizon_hours"],
+    )
+    candidate["metadata_schema_version"] = 1
+    candidate["artifact"]["path"] = "lstm_checkpoint.pt"
+    candidate["training"] = {"seed": training["seed"], **training["training"]}
+    candidate["requirements"] = {
+        "python": training["python_version"],
+        "pytorch": str(training["torch_version"]),
+    }
+    candidate["signature"] = {
+        "input": {"shape": [None, 48, len(features)], "dtype": "float32",
+                  "name": "imputed_standardized_hourly_features"},
+        "output": {"shape": [None, 24], "dtype": "float32",
+                   "name": "standardized_temperature_h01_h24"},
+    }
+    return candidate
+
+
+def verify_temperature_checkpoint(
+    checkpoint_path: Path, training_path: Path, artifact_hash: str
+) -> None:
+    import torch
+    from torch.torch_version import TorchVersion
+
+    from aetherix_weather.lstm import TemperatureLSTM
+
+    if sha256_file(checkpoint_path) != artifact_hash:
+        raise ValueError("Checkpoint artifact hash does not match the registry package.")
+    training = _read_json(training_path)
+    # PyTorch saved its version as a TorchVersion string subclass in Day 4B.
+    with torch.serialization.safe_globals([TorchVersion]):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    for field, value in training.items():
+        if checkpoint.get(field) != value:
+            raise ValueError(f"Checkpoint differs from its training metadata for {field}.")
+    config = dict(training["architecture"])
+    sequence_length = config.pop("sequence_length")
+    model = TemperatureLSTM(**config).eval()
+    model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+    with torch.inference_mode():
+        output = model(torch.zeros(2, sequence_length, config["input_size"]))
+    if output.shape != (2, 24) or output.dtype != torch.float32 or not output.isfinite().all():
+        raise ValueError("Temperature LSTM did not produce 24 finite float32 forecasts.")
+
+
+def _registry_metrics(metadata: dict[str, Any]) -> dict[str, float]:
+    return {"validation_scaled_mse": metadata["validation_metrics"]["scaled_mse"]["value"]}
+
+
+def _verify_registered_model(model: Any, download: Path, metadata: dict[str, Any]) -> None:
+    if (
+        _read_json(download / "registry_metadata.json") != metadata
+        or sha256_file(download / "lstm_checkpoint.pt") != metadata["artifact"]["sha256"]
+        or model.training_metrics != _registry_metrics(metadata)
+        or model.model_schema != _sdk_model_schema(metadata).to_dict()
+    ):
+        raise ValueError("Model Registry read-back does not match the prepared package.")
+
+
+def _sdk_model_schema(metadata: dict[str, Any]) -> Any:
+    from hsml.model_schema import ModelSchema
+    from hsml.schema import Schema
+
+    def tensor(spec: dict[str, Any]) -> Schema:
+        return Schema([{"name": spec["name"], "type": spec["dtype"],
+                        "shape": tuple(-1 if size is None else size for size in spec["shape"])}])
+
+    signature = metadata["signature"]
+    return ModelSchema(tensor(signature["input"]), tensor(signature["output"]))
+
+
+def sync_registry_candidate(
+    registry: Any, package: Path, metadata: dict[str, Any], *, execute: bool
+) -> tuple[int | None, bool]:
+    """Read an equivalent version or explicitly register and verify a new one."""
+    name = metadata["model_name"]
+    digest = metadata["artifact"]["sha256"]
+    versions = registry.get_models(name)
+    for model in versions:
+        with TemporaryDirectory() as directory:
+            download = Path(model.download(directory))
+            existing = download / "lstm_checkpoint.pt"
+            if digest in (model.description or "") or (
+                existing.is_file() and sha256_file(existing) == digest
+            ):
+                _verify_registered_model(model, download, metadata)
+                return model.version, False
+    if not execute:
+        return None, False
+    if sha256_file(package / "lstm_checkpoint.pt") != digest:
+        raise ValueError("Staged registry checkpoint has changed.")
+    registered = registry.python.create_model(
+        name,
+        description=f"Temperature LSTM h01-h24. Checkpoint SHA-256: {digest}",
+        metrics=_registry_metrics(metadata),
+        model_schema=_sdk_model_schema(metadata),
+    ).save(str(package))
+    remote = registry.get_model(name, version=registered.version)
+    if remote is None:
+        raise RuntimeError("Saved model version was not visible on read-back.")
+    with TemporaryDirectory() as directory:
+        _verify_registered_model(remote, Path(remote.download(directory)), metadata)
+    return remote.version, True
