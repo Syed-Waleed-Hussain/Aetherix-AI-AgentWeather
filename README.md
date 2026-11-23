@@ -483,6 +483,65 @@ estimates. Forecasts use the saved historical snapshot, and the cloud sample's
 17-feature projection does not supply the baseline models' full input schema.
 Groq and Hopsworks are optional for running the graph locally.
 
+## Day 7: Dashboard and scheduled checks
+
+From the repository root, use the existing Python 3.12 environment.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r dashboard/requirements.txt
+.\.venv\Scripts\python.exe -m streamlit run dashboard/app.py --server.address 127.0.0.1
+```
+
+The dashboard opens **Overview**, **24-Hour Forecast**, **Weather Alerts**,
+**AI Weather Report**, **Model Performance**, and **MLOps & Agent Monitoring**.
+Forecast charts cover temperature, humidity, wind speed and direction,
+precipitation, rain probability, UV, and US AQI. Timestamps display in Karachi
+time. Workflow reports retain their original UTC timestamps.
+
+Generate a saved state with the Day 6 command if the decision database is
+empty. The sidebar replays saved runs or starts a new local 24-hour graph run
+when the model files and LangGraph are available. The application caches
+the local inference source and serializes button-triggered runs in-process.
+Forecasts from the November 11 snapshot are historical. The app reads
+SQLite for replay and retains all earlier decisions when a new run is added.
+
+Model Performance presents separate classical-versus-SARIMAX and
+classical-versus-LSTM temperature cohorts. The SARIMAX comparison joins exact
+issue and target timestamps and verifies matching actual values before
+scoring. The LSTM view requires identical timestamp fingerprints within the
+saved cohort. Validation champion decisions appear separately from test results.
+
+| GitHub Actions workflow | Trigger | Behavior |
+| --- | --- | --- |
+| Hourly Open-Meteo ingestion check | Minute 17 each hour or manual dispatch | Fetch the last 24 completed provider hours, validate their UTC keys, and write an ephemeral runner JSON with status. Source values are modeled estimates. |
+| Daily drift and training eligibility | 01:47 UTC or manual dispatch | Check local data, validation manifest, and matching drift evidence. Report the gate decision. Retraining and champion promotion require a later approved pipeline. |
+
+Both jobs have read-only repository permissions, per-workflow concurrency
+limits, and five-minute job timeouts. Once the changes are on the default
+branch, use **Actions** to dispatch either workflow and inspect its JSON log.
+Hosted runner files expire with the runner. These workflows publish no dataset
+artifacts and make no Hopsworks writes. The hourly check deduplicates within
+each run by requiring exact hourly keys. Cross-run deduplication and training
+need a verified persistent store. Monitor any applicable GitHub plan limits.
+
+Run the same checks locally with
+`python -m scripts.mlops_check ingestion --output outputs/mlops/ingestion.json`
+and `python -m scripts.mlops_check training-gate --output outputs/mlops/training-gate.json`.
+The training gate reports missing persistence on hosted runners until the
+inputs and artifact store are deliberately configured.
+
+For Streamlit Community Cloud, select `dashboard/app.py` and Python 3.12.
+The entrypoint directory supplies lean dashboard dependencies. Set
+`AETHERIX_SNAPSHOT_PATH` to an available saved Day 6 JSON to serve a read-only
+snapshot without model artifacts. The repo ignores local datasets, SQLite,
+and model artifacts. Hosting a data-backed dashboard still requires a
+deliberately supplied snapshot and any evaluation reports you want to show.
+For an inference-enabled instance with an existing free-tier Groq account,
+configure root-level `GROQ_API_KEY` and `GROQ_MODEL` in platform secrets and
+opt in from the sidebar. The default report uses the deterministic template.
+Hopsworks status reflects 24 previously verified rows, with full sync and
+Model Registry registration pending.
+
 ## Tests and existing live smoke test
 
 Run all deterministic tests offline:

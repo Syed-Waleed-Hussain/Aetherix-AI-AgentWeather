@@ -1,0 +1,23 @@
+name: Daily drift and training eligibility
+on:
+  schedule:
+    - cron: "47 1 * * *"
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: weather-training-eligibility
+  cancel-in-progress: false
+jobs:
+  evaluate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install "requests>=2.32,<3" "pandas>=2.2,<3" "tzdata>=2024.1"
+      - run: python -m scripts.mlops_check training-gate --output outputs/mlops/training-gate.json

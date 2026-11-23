@@ -178,6 +178,7 @@ def run_workflow(
     root: Path, store: DecisionStore, *, city: str = "karachi", horizon: int = 24,
     issue: str | None = None, synthetic: bool = False, audience: str = "general",
     thresholds: dict | None = None, provider: Callable[[bool], str] | None = None,
+    source: LocalForecastSource | None = None,
 ) -> AgentState:
     if str(city).lower() != "karachi":
         raise InputError("The validated model bundle supports Karachi only.")
@@ -196,6 +197,7 @@ def run_workflow(
     }
     if synthetic:
         provider = None
-    graph = build_graph(LocalForecastSource(root), store, thresholds, provider)
+    graph = build_graph(source if source is not None else LocalForecastSource(root),
+                        store, thresholds, provider)
     with tracing_context(enabled=False):
         return graph.invoke(state, config={"recursion_limit": 8})
