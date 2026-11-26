@@ -11,6 +11,8 @@ Open-Meteo historical weather values are reanalysis/model estimates.
 Air-quality and AQI values are modeled CAMS estimates, not direct sensor
 observations and not predictions from a trained AETHERIX model.
 
+Live Demo : https://aetherix-ai-agentweather-ehmuptrinjmjlnjuhnunin.streamlit.app/
+
 ## Requirements and installation
 
 - Python 3.12
