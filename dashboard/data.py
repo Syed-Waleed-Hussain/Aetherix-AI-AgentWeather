@@ -60,10 +60,10 @@ def replay(path: Path, request_id: str) -> dict:
 
 def data_status(state: dict) -> str:
     if state.get("mode") == "synthetic":
-        return "Synthetic demonstration"
-    if state.get("mode") == "local" and state.get("issue_utc"):
-        return "Historical forecast"
-    return "Forecast unavailable"
+        return "SYNTHETIC · demonstration fixture"
+    if state.get("mode") == "local" and state.get("issue_utc") and state.get("predictions"):
+        return "HISTORICAL · archived model forecast"
+    return "UNAVAILABLE · forecast data missing"
 
 
 def local_time(value: str | None) -> str:

@@ -27,9 +27,10 @@ def test_dashboard_reads_real_graph_state_and_every_metric(tmp_path):
     assert run_history(path)[0]["request_id"] == state["request_id"]
     assert replay(path, state["request_id"]) == state
     assert replay(path, "' OR 1=1 --") == {}
-    assert data_status(state) == "Synthetic demonstration"
-    assert data_status({**state, "mode": "local"}) == "Historical forecast"
-    assert data_status({}) == "Forecast unavailable"
+    assert data_status(state).startswith("SYNTHETIC")
+    assert data_status({**state, "mode": "local"}).startswith("HISTORICAL")
+    assert data_status({**state, "mode": "local", "predictions": []}).startswith("UNAVAILABLE")
+    assert data_status({}).startswith("UNAVAILABLE")
     assert state["drift"]["status"] == "input_shift"
     for metric in METRICS:
         frame = forecast_frame(state, metric)
@@ -190,3 +191,45 @@ def test_streamlit_renders_all_sections_and_plotly_metrics(tmp_path, monkeypatch
                 assert len(plots) == 1
                 spec = json.loads(plots[0].proto.spec)
                 assert len(spec["data"][0]["x"]) == 24
+
+
+def test_bundled_read_only_demo_keeps_forecast_provenance(tmp_path, monkeypatch):
+    import asyncio
+
+    testing = pytest.importorskip("streamlit.testing.v1")
+    from streamlit.testing.v1 import local_script_runner
+
+    monkeypatch.setattr(local_script_runner, "asyncio",
+                        SimpleNamespace(new_event_loop=asyncio.BaseEventLoop))
+    monkeypatch.setenv("AETHERIX_MODE", "snapshot")
+    monkeypatch.delenv("AETHERIX_SNAPSHOT_PATH", raising=False)
+    path = tmp_path / "unused.sqlite3"
+    monkeypatch.setenv("AETHERIX_AGENT_DB", str(path))
+    demo = json.loads((ROOT / "dashboard/demo_snapshot.json").read_text(encoding="utf-8"))
+    assert demo["mode"] == "local"
+    assert not {"request_id", "decisions", "errors"}.intersection(demo)
+    issue = pd.Timestamp(demo["issue_utc"])
+    assert issue == pd.Timestamp("2026-11-11T18:00:00Z")
+    valid_times = pd.date_range(issue, periods=25, freq="h")[1:].tolist()
+    for metric in METRICS:
+        frame = forecast_frame(demo, metric)
+        assert frame["horizon"].tolist() == list(range(1, 25))
+        assert frame["valid_at_pkt"].dt.tz_localize("Asia/Karachi").dt.tz_convert("UTC").tolist() == valid_times
+        assert not frame["model"].isin(["Unavailable", "synthetic"]).any()
+    app = testing.AppTest.from_file(str(ROOT / "dashboard/app.py"), default_timeout=30).run()
+    assert any("HISTORICAL" in item.value for item in app.markdown)
+    assert any("UNAVAILABLE" in item.value for item in app.caption)
+    assert app.sidebar.button[0].disabled
+    for page in app.sidebar.radio[0].options[1:]:
+        app.sidebar.radio[0].set_value(page).run()
+        assert not app.exception
+        assert app.title
+        if page == "Weather Alerts":
+            assert any("Seek shade" in item.value for item in app.markdown)
+            app.selectbox[0].set_value("Outdoor workers").run()
+            assert any("Use shade during breaks" in item.value for item in app.markdown)
+        elif page == "Model Performance":
+            assert len(app.dataframe[0].value) == 2
+            app.selectbox[0].set_value("LSTM").run()
+            assert len(app.dataframe[0].value) >= 2
+    assert not path.exists()

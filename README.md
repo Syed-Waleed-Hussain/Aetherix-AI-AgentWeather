@@ -531,16 +531,19 @@ The training gate reports missing persistence on hosted runners until the
 inputs and artifact store are deliberately configured.
 
 For Streamlit Community Cloud, select `dashboard/app.py` and Python 3.12.
-The entrypoint directory supplies lean dashboard dependencies. Set
-`AETHERIX_SNAPSHOT_PATH` to an available saved Day 6 JSON to serve a read-only
-snapshot without model artifacts. The repo ignores local datasets, SQLite,
-and model artifacts. Hosting a data-backed dashboard still requires a
-deliberately supplied snapshot and any evaluation reports you want to show.
-For an inference-enabled instance with an existing free-tier Groq account,
-configure root-level `GROQ_API_KEY` and `GROQ_MODEL` in platform secrets and
-opt in from the sidebar. The default report uses the deterministic template.
-Hopsworks status reflects 24 previously verified rows, with full sync and
-Model Registry registration pending.
+A fresh checkout opens the bundled read-only demonstration automatically.
+It shows forecasts issued on 11 November 2026, with archived inputs, alerts,
+a report, matched evaluation scores, and a drift summary. No secrets are
+needed. Set `AETHERIX_MODE=snapshot` to preview that mode in a local workspace
+with models and a SQLite history. See the [deployment guide](DEPLOYMENT_GUIDE.md)
+for launch steps and configuration.
+
+## Day 8 delivery
+
+- [Final project report](FINAL_PROJECT_REPORT.md)
+- [Deployment guide](DEPLOYMENT_GUIDE.md)
+- [Jury demonstration script](DEMO_SCRIPT.md)
+- [Final verification and release checklist](FINAL_VERIFICATION.md)
 
 ## Tests and existing live smoke test
 

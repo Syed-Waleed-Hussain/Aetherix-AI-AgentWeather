@@ -26,6 +26,12 @@ PAGES = ("Overview", "24-Hour Forecast", "Weather Alerts", "AI Weather Report",
          "Model Performance", "MLOps & Agent Monitoring")
 DB = Path(os.environ.get("AETHERIX_AGENT_DB", str(ROOT / "outputs/agents/decisions.sqlite3")))
 ARTIFACTS = ROOT / "artifacts"
+DEMO = Path(__file__).with_name("demo_snapshot.json")
+LOCAL_INPUTS = tuple(ROOT / entry for entry in (
+    "data/processed/features.csv", "artifacts/day3_5/selected_models.json",
+    "artifacts/day3_5/selected_models.joblib", "artifacts/day5c/champion_selection.json",
+    "artifacts/day3_5/test_predictions.csv",
+))
 AUDIENCES = {"General public": "general", "Outdoor workers": "outdoor_workers",
              "Children and sensitive groups": "sensitive_groups"}
 
@@ -42,6 +48,11 @@ def evaluation_table(root: Path, family: str, hour: int):
     return comparisons(root, family, hour)
 
 
+@st.cache_data(show_spinner=False)
+def bundled_demo():
+    return read_object(DEMO)
+
+
 def status_table(state):
     return pd.DataFrame([
         {"Agent": key.replace("_", " ").title(), "Status": value}
@@ -49,7 +60,10 @@ def status_table(state):
     ])
 
 
-def saved_state(history: list[dict], selected: str | None) -> dict:
+def saved_state(history: list[dict], selected: str | None, snapshot: bool) -> dict:
+    if snapshot:
+        configured = os.environ.get("AETHERIX_SNAPSHOT_PATH")
+        return read_object(Path(configured)) if configured else bundled_demo()
     if selected:
         return replay(DB, selected)
     configured = os.environ.get("AETHERIX_SNAPSHOT_PATH")
@@ -60,9 +74,13 @@ def saved_state(history: list[dict], selected: str | None) -> dict:
     return replay(DB, newest["request_id"]) if newest else read_object(ROOT / "outputs/agents/local.json")
 
 
-def controls(history):
+def controls(history, snapshot):
     st.sidebar.markdown('<div class="wordmark">AETHERIX AI</div>', unsafe_allow_html=True)
     page = st.sidebar.radio("Workspace", PAGES)
+    if snapshot:
+        st.sidebar.caption("Read-only demonstration. Local forecast runs and saved-run replay are disabled.")
+        st.sidebar.button("Run 24-hour forecast", disabled=True)
+        return page, None
     runs = {row["request_id"]: row for row in history}
     chosen = st.sidebar.selectbox(
         "Saved run", [None, *runs],
@@ -70,12 +88,7 @@ def controls(history):
             f"{local_time(runs[key]['issue_utc'])} · {key[:8]}" if key else "Latest historical run"
         ),
     )
-    paths = [ROOT / entry for entry in (
-        "data/processed/features.csv", "artifacts/day3_5/selected_models.json",
-        "artifacts/day3_5/selected_models.joblib", "artifacts/day5c/champion_selection.json",
-        "artifacts/day3_5/test_predictions.csv",
-    )]
-    local_enabled = all(p.is_file() for p in paths[:3]) and find_spec("langgraph") is not None
+    local_enabled = all(p.is_file() for p in LOCAL_INPUTS[:3]) and find_spec("langgraph") is not None
     with st.sidebar.expander("Run local forecast"):
         audience = st.selectbox("Run audience", list(AUDIENCES))
         groq = st.checkbox("Use free-tier Groq layout", disabled=not local_enabled)
@@ -91,7 +104,8 @@ def controls(history):
                         st.secrets.get("GROQ_MODEL")
                     except (FileNotFoundError, ValueError):
                         pass
-                version = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None for p in paths)
+                version = tuple((p.stat().st_mtime_ns, p.stat().st_size) if p.is_file() else None
+                                for p in LOCAL_INPUTS)
                 source, lock = runtime(ROOT, version)
                 if not lock.acquire(blocking=False):
                     st.info("A forecast is already running. Try again when it finishes.")
@@ -116,8 +130,8 @@ def controls(history):
 def overview(state):
     st.title("Karachi weather intelligence")
     st.caption("Asia/Karachi · Forecast issue " + local_time(state.get("issue_utc")))
-    st.subheader("Latest available observation")
-    st.caption("Saved issue-hour weather and modeled AQI from the workflow input.")
+    st.subheader("Saved issue-hour inputs")
+    st.caption("Weather and modeled AQI used by this forecast.")
     inputs = state.get("weather_aqi_inputs", {})
     cols = st.columns(4)
     for column, key in zip(cols, ("temperature_c", "relative_humidity_percent", "wind_speed_kmh", "us_aqi")):
@@ -135,7 +149,10 @@ def overview(state):
         st.warning(f"{alert['explanation']} {local_time(alert['start_utc'])}")
     st.subheader("Agent execution")
     table = status_table(state)
-    st.dataframe(table, hide_index=True) if not table.empty else st.caption("No agent execution recorded.")
+    if table.empty:
+        st.caption("No agent execution recorded.")
+    else:
+        st.dataframe(table, hide_index=True)
 
 
 def forecast_page(state):
@@ -143,6 +160,7 @@ def forecast_page(state):
     metric = st.selectbox("Metric", list(METRICS), format_func=lambda key: METRICS[key][0],
                           key="forecast_metric")
     frame = forecast_frame(state, metric)
+    st.caption("Forecast issue · " + local_time(state.get("issue_utc")))
     st.caption(f"{len(frame)} of {state.get('horizon', 24)} forecast hours · {METRICS[metric][1]} · Karachi time")
     if frame.empty:
         st.info("No values are available for this metric in the selected run.")
@@ -184,16 +202,22 @@ def report_page(state):
         st.info("A saved report is required.")
 
 
-def performance_page(state):
+def performance_page(state, snapshot):
     st.title("Model performance")
     family = st.selectbox("Matched test cohort", ["SARIMAX", "LSTM"])
     hour = st.slider("Forecast horizon", 1, 24, 1)
-    table = evaluation_table(ARTIFACTS, family, hour)
-    st.caption("Temperature · classical ML versus " + family + " within this experiment's held-out cohort")
+    table = (pd.DataFrame(state.get("evaluation", {}).get(family, {}).get(str(hour), []))
+             if snapshot else evaluation_table(ARTIFACTS, family, hour))
+    st.caption(f"Temperature · {family} matched holdout · MAE and RMSE in °C")
     if table.empty:
         st.info("No verified common-cohort results are available for this selection.")
     else:
         st.dataframe(table, hide_index=True)
+    if snapshot:
+        st.caption("Saved matched-cohort scores. Full validation and training artifacts are available in the local workspace.")
+        with st.expander("Data lineage and provenance"):
+            st.json(state.get("model_provenance", {}))
+        return
     st.subheader("Validation champions")
     metric = st.selectbox("Champion target", list(METRICS), format_func=lambda key: METRICS[key][0])
     table = champion_rows(ARTIFACTS, metric)
@@ -211,16 +235,22 @@ def performance_page(state):
         st.json(state.get("model_provenance", {}))
 
 
-def monitoring_page(state, history):
+def monitoring_page(state, history, snapshot):
     st.title("MLOps & agent monitoring")
     latest = next((row for row in history if row["mode"] == "local"
                    and row["forecast_status"] == "ok" and row["completed_at_utc"]), None)
-    st.caption("Last successful local forecast · " + local_time(latest["completed_at_utc"] if latest else None))
+    if snapshot:
+        st.caption("Saved forecast execution · " + local_time(state.get("completed_at_utc")))
+    else:
+        st.caption("Last successful local forecast · " + local_time(latest["completed_at_utc"] if latest else None))
     if history:
         st.dataframe(history, hide_index=True)
     st.subheader("Decision trail")
     if state.get("decisions"):
         st.dataframe(state["decisions"], hide_index=True)
+    elif snapshot:
+        st.dataframe(status_table(state), hide_index=True)
+        st.caption("Full decision history is available in the local SQLite workspace.")
     if state.get("errors"):
         st.warning("This run contains one or more agent errors. See the decision statuses.")
     st.subheader("Drift monitor")
@@ -228,15 +258,21 @@ def monitoring_page(state, history):
     st.write(drift.get("status", "Unavailable").replace("_", " ").title())
     if drift:
         st.write(drift.get("recommended_action", "Review available evidence."))
-        st.caption(f"{len(drift.get('affected_features', []))} feature flags · "
-                   f"{len(drift.get('affected_models', []))} target/horizon error flags")
-        with st.expander("Drift measurements and thresholds"):
-            st.json(drift.get("thresholds", {}))
-            st.dataframe(drift.get("features", []), hide_index=True)
-            st.dataframe(drift.get("forecast_errors", []), hide_index=True)
+        feature_count = drift.get("feature_flag_count", len(drift.get("affected_features", [])))
+        error_count = drift.get("forecast_error_flag_count", len(drift.get("affected_models", [])))
+        st.caption(f"{feature_count} feature flags · {error_count} target/horizon error flags")
+        st.caption("Drift evaluated as of " + local_time(drift.get("evaluated_as_of_utc")))
+        if not snapshot:
+            with st.expander("Drift measurements and thresholds"):
+                st.json(drift.get("thresholds", {}))
+                st.dataframe(drift.get("features", []), hide_index=True)
+                st.dataframe(drift.get("forecast_errors", []), hide_index=True)
     st.subheader("Hopsworks")
     st.markdown("**Feature Store** · 24 rows previously verified. Full sync pending.  \n"
                 "**Model Registry** · Local package prepared. Cloud registration pending.")
+    if snapshot:
+        st.caption("Cloud connectivity checks are disabled in read-only mode.")
+        return
     sdk = ROOT / ".venv-hopsworks" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if st.button("Check connectivity", disabled=not sdk.is_file()):
         try:
@@ -253,22 +289,32 @@ def monitoring_page(state, history):
 def main():
     st.set_page_config(page_title="Aetherix AI | Karachi Weather", layout="wide")
     st.html(Path(__file__).with_name("style.css"))
+    local_state = DB.is_file() or (ROOT / "outputs/agents/local.json").is_file() or LOCAL_INPUTS[0].is_file()
+    snapshot = os.environ.get("AETHERIX_MODE") == "snapshot" or not local_state
+    history = []
+    if not snapshot:
+        try:
+            history = run_history(DB)
+        except (sqlite3.Error, ValueError):
+            st.warning("The local decision database could not be read.")
+    page, selected = controls(history, snapshot)
     try:
-        history = run_history(DB)
-    except (sqlite3.Error, ValueError):
-        history = []
-        st.warning("The local decision database could not be read.")
-    page, selected = controls(history)
-    try:
-        state = saved_state(history, selected)
+        state = saved_state(history, selected, snapshot)
     except (sqlite3.Error, ValueError):
         state = {}
         st.warning("The selected run could not be read.")
     st.markdown(f'<div class="statusline">{data_status(state)}</div>', unsafe_allow_html=True)
+    st.caption("Live observation · UNAVAILABLE")
+    if snapshot:
+        st.caption("Read-only snapshot · Karachi historical demonstration")
+        if not state:
+            st.warning("The forecast snapshot is missing or could not be read.")
     if page == PAGES[-1]:
-        monitoring_page(state, history)
+        monitoring_page(state, history, snapshot)
+    elif page == "Model Performance":
+        performance_page(state, snapshot)
     else:
-        pages = (overview, forecast_page, alerts_page, report_page, performance_page)
+        pages = (overview, forecast_page, alerts_page, report_page)
         pages[PAGES.index(page)](state)
 
 
